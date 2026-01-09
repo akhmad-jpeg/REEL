@@ -1,3 +1,5 @@
+![image alt](https://github.com/akhmad-jpeg/REEL/blob/main/REEL%20Windows/logo.png?raw=true)
+
 # 🎵 REEL
 
 A powerful Python-based music downloader that fetches high-quality audio from YouTube with proper metadata from Spotify.
