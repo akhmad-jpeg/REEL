@@ -1,0 +1,63 @@
+MIT License with Personal Use Restriction
+
+Copyright (c) 2026 REEL Music Downloader
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to use
+the Software for PERSONAL, NON-COMMERCIAL purposes only, subject to the
+following conditions:
+
+1. PERSONAL USE ONLY
+   This software is licensed for personal use only. Commercial use, including
+   but not limited to selling, distributing for profit, or using in commercial
+   services is strictly prohibited.
+
+2. ATTRIBUTION
+   The above copyright notice and this permission notice shall be included in
+   all copies or substantial portions of the Software.
+
+3. NO WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+4. LEGAL COMPLIANCE
+   Users must comply with all applicable laws and regulations, including but not
+   limited to copyright laws. This software is intended for downloading legally
+   available content only. The author is not responsible for any misuse of this
+   software.
+
+5. API TERMS
+   Users must comply with the Terms of Service of all third-party APIs used by
+   this software, including:
+   - Spotify API Terms of Service
+   - YouTube Terms of Service
+   - Genius API Terms of Service
+
+6. CONTENT RIGHTS
+   Users are responsible for ensuring they have the right to download and possess
+   any content obtained through this software. Support artists through legal
+   channels including streaming services, concert tickets, and merchandise.
+
+---
+
+DISCLAIMER OF LIABILITY
+
+This software is a tool for personal media management. The developers and
+distributors of this software:
+
+- Do NOT encourage or condone copyright infringement
+- Are NOT responsible for how users choose to use this software
+- Make NO warranties about the legality of content downloaded
+- Assume NO liability for any legal consequences of software use
+- Recommend users support artists through official channels
+
+USE AT YOUR OWN RISK
+
+By using this software, you acknowledge that you understand and accept these
+terms, and that you are solely responsible for your use of the software and
+any consequences thereof.
