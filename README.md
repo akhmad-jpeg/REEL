@@ -14,8 +14,9 @@ A powerful Python-based music downloader that fetches high-quality audio from Yo
 2. Log in (or create free account)
 3. Click "Create App"
 4. Enter any name/description
-5. Copy your Client ID and Client Secret
-6. Run the app and go to Settings (Option 7) → Configure Spotify API
+5. Redirect URL: https://localhost:8888/callback
+6. Copy your Client ID and Client Secret
+7. Run the app and go to Settings (Option 7) → Configure Spotify API
 
 **That's it!** The API is 100% free, no credit card required.
 
