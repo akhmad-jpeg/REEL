@@ -1,30 +1,15 @@
-import os
-import csv
-import re
-import sys
-import subprocess
-import warnings
-import requests
-import time
-
-import yt_dlp
-import spotipy
+import os, csv, re, sys, subprocess, warnings, requests, time
+import yt_dlp, spotipy, lyricsgenius
 from spotipy.oauth2 import SpotifyClientCredentials
 import spotipy.exceptions
-import lyricsgenius
+from mutagen.id3 import ID3, TIT2, TALB, TPE1, TPE2, TRCK, TPOS, TDRC, APIC, USLT, ID3NoHeaderError
 
-from mutagen.id3 import (
-    ID3, TIT2, TALB, TPE1, TPE2,
-    TRCK, TPOS, TDRC, APIC, USLT, ID3NoHeaderError
-)
-
-# Try to import colorama for Windows color support
+# Color support
 try:
     from colorama import init as colorama_init, Fore, Style, Back
     colorama_init(autoreset=True)
     COLORS_AVAILABLE = True
 except ImportError:
-    # Fallback if colorama not installed
     COLORS_AVAILABLE = False
     class Fore:
         RED = GREEN = YELLOW = CYAN = MAGENTA = BLUE = WHITE = LIGHTWHITE_EX = LIGHTGREEN_EX = LIGHTCYAN_EX = LIGHTYELLOW_EX = LIGHTMAGENTA_EX = ""
@@ -35,325 +20,166 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-# ======================= UTILITIES =======================
+# ========================= GLOBALS ===========================
+
+BASE = os.path.join(os.path.expanduser("~"), "Music Library")
+DIRS = {}
+
+sp = None
+genius = None
+
+# ========================= HELPERS ===========================
+
+def clean_name(s):
+    """Clean string for filename"""
+    return re.sub(r'[<>:"/\\|?*]', '', s).strip()
 
 def clean_path(p):
-    """Clean and normalize file paths"""
-    return os.path.abspath(p.strip().strip('"').strip("'"))
+    """Clean and expand path"""
+    return os.path.abspath(os.path.expanduser(p.strip().strip('"').strip("'")))
 
-def clean_name(t):
-    """Remove invalid filename characters"""
-    return re.sub(r'[<>:"/\\|?*]', '', t).strip()
+class yt_logger:
+    """Suppress yt-dlp logs and warnings"""
+    def debug(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg): pass
+    def info(self, msg): pass
 
-def audio_duration_seconds(path):
-    """Get audio file duration using ffprobe"""
-    try:
-        cmd = [
-            "ffprobe",
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            path
-        ]
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=False
-        )
-        return float(result.stdout.strip())
-    except Exception:
-        return 0
-
-def wait_for_file_ready(path, timeout=10):
-    """Wait for file to finish writing"""
-    start = time.time()
-    last_size = -1
-
-    while time.time() - start < timeout:
-        if not os.path.exists(path):
-            time.sleep(0.2)
-            continue
-
-        size = os.path.getsize(path)
-        if size > 0 and size == last_size:
-            return True
-
-        last_size = size
-        time.sleep(0.3)
-
-    return False
-
-# ===================== YT-DLP LOGGER =====================
-
-def yt_logger():
-    """Silent logger for yt-dlp"""
-    class Logger:
-        def debug(self, msg): pass
-        def warning(self, msg): pass
-        def error(self, msg): pass
-    return Logger()
-
-# ======================== DIRECTORIES ====================
-
-BASE = os.path.join(os.getcwd(), "Music Library")
+def progress_hook(d):
+    """Show download progress"""
+    if d['status'] == 'downloading':
+        percent = d.get('_percent_str', '0%').strip()
+        speed = d.get('_speed_str', 'N/A').strip()
+        eta = d.get('_eta_str', 'N/A').strip()
+        print(f"\r{Fore.CYAN}[DOWNLOADING]{Style.RESET_ALL} {percent} | Speed: {speed} | ETA: {eta}     ", end='', flush=True)
+    elif d['status'] == 'finished':
+        print(f"\r{Fore.GREEN}[DOWNLOADED]{Style.RESET_ALL} Converting to MP3...                    ", end='', flush=True)
 
 def set_dirs(new_base=None):
-    """Initialize or update directory structure"""
+    """Initialize directory structure"""
     global BASE, DIRS
     if new_base:
         BASE = clean_path(new_base)
-
+    
     DIRS = {
         "SINGLE": os.path.join(BASE, "Singles"),
         "ALBUM": os.path.join(BASE, "Albums"),
         "CSV": os.path.join(BASE, "CSV Imports"),
         "URLS_TXT": os.path.join(BASE, "URLs TXT"),
-        "PLAYLIST": os.path.join(BASE, "Spotify Playlists")
+        "PLAYLIST": os.path.join(BASE, "Spotify Playlists"),
+        "YT_PLAYLIST": os.path.join(BASE, "YouTube Playlists")
     }
-
+    
     for d in DIRS.values():
         os.makedirs(d, exist_ok=True)
 
 set_dirs()
 
-# ========================= AUTH ==========================
+# ========================= AUTH ==============================
 
 def init_spotify():
-    """Initialize Spotify client with credentials from environment"""
+    """Initialize Spotify client"""
     client_id = os.getenv("SPOTIFY_CLIENT_ID")
     client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-    
     if not client_id or not client_secret:
-        # Return None, will be initialized later when credentials are provided
         return None
-    
     try:
-        return spotipy.Spotify(
-            auth_manager=SpotifyClientCredentials(
-                client_id=client_id,
-                client_secret=client_secret
-            )
-        )
-    except Exception as e:
-        print(f"\n[ERROR] Failed to initialize Spotify client: {e}")
+        return spotipy.Spotify(auth_manager=SpotifyClientCredentials(client_id=client_id, client_secret=client_secret))
+    except:
         return None
 
 def init_genius():
-    """Initialize Genius client with credentials from environment"""
-    token = os.getenv("GENIUS_TOKEN")
-    
+    """Initialize Genius client"""
+    token = os.getenv("GENIUS_TOKEN", "")
     if not token:
-        # Genius is optional, so just silently create client
-        token = ""
-    
+        return None
     try:
-        return lyricsgenius.Genius(
-            token,
-            skip_non_songs=True,
-            remove_section_headers=True
-        )
+        return lyricsgenius.Genius(token, skip_non_songs=True, remove_section_headers=True)
     except:
         return None
 
 sp = init_spotify()
 genius = init_genius()
 
-# ======================= PROGRESS ========================
+# ========================= METADATA ==========================
 
-def progress_hook(d):
-    """Display download progress"""
-    title = d.get("info_dict", {}).get("title", "Unknown")
-    if d["status"] == "downloading":
-        total = d.get("total_bytes") or d.get("total_bytes_estimate")
-        done = d.get("downloaded_bytes", 0)
-        if total:
-            pct = done / total * 100
-            print(f"\r[Downloading] {title[:40]:40} | {pct:5.1f}%", end="", flush=True)
-    elif d["status"] == "finished":
-        print(f"\r[Processing] {title[:60]}".ljust(90))
-
-# ====================== SPOTIFY META =====================
-
-def build_meta(t):
-    """Build metadata dictionary from Spotify track object"""
-    a = t["album"]
+def build_meta(item):
+    """Build metadata dict from Spotify track"""
     return {
-        "track": t["name"],
-        "artist": ", ".join(x["name"] for x in t["artists"]),
-        "album": a["name"],
-        "album_artist": a["artists"][0]["name"],
-        "track_no": t["track_number"],
-        "disc_no": t["disc_number"],
-        "year": a["release_date"][:4],
-        "art": a["images"][0]["url"] if a["images"] else None,
-        "duration": t["duration_ms"] / 1000 
+        "track": item["name"],
+        "artist": item["artists"][0]["name"],
+        "album": item["album"]["name"],
+        "album_artist": item["album"]["artists"][0]["name"],
+        "track_no": item["track_number"],
+        "disc_no": item["disc_number"],
+        "year": item["album"]["release_date"][:4],
+        "art": item["album"]["images"][0]["url"] if item["album"]["images"] else None,
+        "duration": item["duration_ms"] / 1000
     }
 
-
 def spotify_meta(track, artist):
-    """Search Spotify for track metadata with improved matching"""
+    """Search Spotify for track metadata with smart scoring"""
     if not sp:
-        print(f"\n[ERROR] Spotify API not configured. Please configure in Settings (Option 7)")
+        print(f"\n{Fore.RED}[ERROR]{Style.RESET_ALL} Spotify API not configured")
         return None
     
     try:
-        q = f'{track} {artist}'
-        r = sp.search(q=q, type="track", limit=10)
+        r = sp.search(q=f'{track} {artist}', type="track", limit=20)
         items = r["tracks"]["items"]
-
         if not items:
             return None
-
-        # 1️⃣ Exact title match
-        for item in items:
-            if item["name"].lower() == track.lower():
-                return build_meta(item)
-
-        # 2️⃣ Featured artist match (partial name in title + artist in credits)
-        for item in items:
-            artists = [a["name"].lower() for a in item["artists"]]
-            if track.lower() in item["name"].lower() and any(artist.lower() in a for a in artists):
-                return build_meta(item)
-
-        # 3️⃣ Final fallback (Spotify best match)
-        return build_meta(items[0])
-
-    except Exception as e:
-        print(f"\n[ERROR] Spotify API: {e}")
+        
+        # Calculate match scores
+        def score(item):
+            s = 0
+            t_name = item["name"].lower().strip()
+            artists = [a["name"].lower().strip() for a in item["artists"]]
+            search_t = track.lower().strip()
+            search_a = artist.lower().strip()
+            
+            if t_name == search_t: s += 100
+            elif search_t in t_name: s += 50
+            
+            if search_a in artists: s += 80
+            elif any(search_a in a for a in artists): s += 40
+            
+            s += min(item.get('popularity', 0) / 10, 5)
+            return s
+        
+        scored = [(score(item), item) for item in items]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        best_score, best_item = scored[0]
+        
+        if best_score >= 100:
+            match_type = "EXACT" if best_score >= 180 else "GOOD" if best_score >= 130 else "CLOSE"
+            color = Fore.GREEN if best_score >= 180 else Fore.YELLOW
+            print(f"{color}[{match_type}]{Style.RESET_ALL} {best_item['name']} by {best_item['artists'][0]['name']} (score: {int(best_score)})")
+            return build_meta(best_item)
+        
+        print(f"{Fore.RED}[NO MATCH]{Style.RESET_ALL} for '{track}' by '{artist}'")
         return None
-
-def spotify_album(album_id):
-    """Get all tracks from a Spotify album"""
-    if not sp:
-        print(f"\n[ERROR] Spotify API not configured. Please configure in Settings (Option 7)")
-        return None, None
-    
-    try:
-        print(f"\n[INFO] Fetching album ID: {album_id}")
-        album = sp.album(album_id)
-        tracks = []
-        for track in album["tracks"]["items"]:
-            tracks.append({
-                "name": track["name"],
-                "artist": track["artists"][0]["name"]
-            })
-        return tracks, album["name"]
-    except spotipy.exceptions.SpotifyException as e:
-        if e.http_status == 404:
-            print(f"\n[ERROR] Album not found. The album may be:")
-            print("  - Not available in your region")
-            print("  - Deleted")
-            print("  - Invalid ID")
-        elif e.http_status == 403:
-            print(f"\n[ERROR] Access forbidden.")
-        else:
-            print(f"\n[ERROR] Spotify API error ({e.http_status}): {e.msg}")
-        return None, None
     except Exception as e:
-        print(f"\n[ERROR] Spotify Album: {e}")
-        return None, None
-
-def search_spotify_album(album_name, artist_name):
-    """Search for album by name and artist, returns album ID if found"""
-    if not sp:
-        print(f"\n[ERROR] Spotify API not configured. Please configure in Settings (Option 7)")
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Spotify: {e}")
         return None
-    
-    try:
-        query = f"album:{album_name} artist:{artist_name}"
-        print(f"\n[INFO] Searching for: {album_name} by {artist_name}")
-        
-        results = sp.search(q=query, type="album", limit=10)
-        albums = results["albums"]["items"]
-        
-        if not albums:
-            print(f"\n[ERROR] No albums found matching '{album_name}' by '{artist_name}'")
-            return None
-        
-        # Show all matches for user to choose
-        print("\n========== ALBUM SEARCH RESULTS ==========")
-        for i, album in enumerate(albums, 1):
-            artists = ", ".join([a["name"] for a in album["artists"]])
-            year = album["release_date"][:4] if album.get("release_date") else "Unknown"
-            total_tracks = album.get("total_tracks", "?")
-            print(f"[{i}] {album['name']} - {artists} ({year}) [{total_tracks} tracks]")
-        
-        # Let user select
-        while True:
-            choice = input(f"\nSelect album [1-{len(albums)}] or 0 to cancel: ").strip()
-            if choice == "0":
-                return None
-            if choice.isdigit() and 1 <= int(choice) <= len(albums):
-                selected = albums[int(choice) - 1]
-                print(f"\n[INFO] Selected: {selected['name']} - {selected['artists'][0]['name']}")
-                return selected["id"]
-            else:
-                print(f"[ERROR] Invalid choice. Enter a number between 1 and {len(albums)}")
-                
-    except Exception as e:
-        print(f"\n[ERROR] Search failed: {e}")
-        return None
-
-def spotify_playlist(playlist_id):
-    """Get all tracks from a Spotify playlist"""
-    if not sp:
-        print(f"\n[ERROR] Spotify API not configured. Please configure in Settings (Option 7)")
-        return None, None
-    
-    try:
-        print(f"\n[INFO] Fetching playlist ID: {playlist_id}")
-        results = sp.playlist_tracks(playlist_id)
-        tracks = []
-        for item in results["items"]:
-            if item["track"]:
-                track = item["track"]
-                tracks.append({
-                    "name": track["name"],
-                    "artist": track["artists"][0]["name"]
-                })
-        
-        playlist = sp.playlist(playlist_id)
-        return tracks, playlist["name"]
-    except spotipy.exceptions.SpotifyException as e:
-        if e.http_status == 404:
-            print(f"\n[ERROR] Playlist not found. The playlist may be:")
-            print("  - Private (you need the playlist owner's permission)")
-            print("  - Deleted")
-            print("  - Invalid ID")
-        elif e.http_status == 403:
-            print(f"\n[ERROR] Access forbidden. The playlist is private.")
-        else:
-            print(f"\n[ERROR] Spotify API error ({e.http_status}): {e.msg}")
-        return None, None
-    except Exception as e:
-        print(f"\n[ERROR] Spotify Playlist: {e}")
-        return None, None
-
-# ========================= TAGGING =======================
 
 def get_lyrics(track, artist):
-    """Fetch lyrics from Genius API if available"""
+    """Fetch lyrics from Genius"""
     if not genius:
         return None
-    
     try:
         song = genius.search_song(track, artist)
-        if song:
-            return song.lyrics
-        return None
-    except Exception as e:
-        print(f"[INFO] Could not fetch lyrics: {e}")
+        return song.lyrics if song else None
+    except:
         return None
 
 def embed(path, meta, lyrics=None):
-    """Embed ID3 tags and album art into MP3 file"""
+    """Embed ID3 tags and artwork"""
     try:
         tags = ID3(path)
     except ID3NoHeaderError:
         tags = ID3()
-
+    
     tags["TIT2"] = TIT2(encoding=3, text=meta["track"])
     tags["TPE1"] = TPE1(encoding=3, text=meta["artist"])
     tags["TALB"] = TALB(encoding=3, text=meta["album"])
@@ -361,188 +187,39 @@ def embed(path, meta, lyrics=None):
     tags["TRCK"] = TRCK(encoding=3, text=str(meta["track_no"]))
     tags["TPOS"] = TPOS(encoding=3, text=str(meta["disc_no"]))
     tags["TDRC"] = TDRC(encoding=3, text=meta["year"])
-
-    # Embed lyrics if available
+    
     if lyrics:
-        from mutagen.id3 import USLT
         tags["USLT"] = USLT(encoding=3, lang='eng', desc='', text=lyrics)
-        print(f"[✓] Lyrics embedded")
-
-    # Download and embed album art
+        print(f"{Fore.GREEN}[✓]{Style.RESET_ALL} Lyrics embedded")
+    
     if meta.get("art"):
         try:
             img = requests.get(meta["art"], timeout=10).content
             tags.delall("APIC")
             tags.add(APIC(encoding=3, mime="image/jpeg", type=3, data=img))
-        except Exception:
+        except:
             pass
-
+    
     tags.save(path)
 
-# ====================== CSV PARSING ======================
+# ======================= DOWNLOAD CORE =======================
 
-TRACK_KEYS = {"track name", "track", "title", "name", "song name"}
-ARTIST_KEYS = {"artist", "artist name", "artist name(s)", "artists", "artist(s)"}
-
-def extract_track_artist(row):
-    """Extract track and artist from CSV row with flexible column names"""
-    r = {k.lower().strip(): str(v).strip() for k, v in row.items() if k}
-
-    track = next((r[k] for k in TRACK_KEYS if k in r and r[k]), None)
-    artist = next((r[k] for k in ARTIST_KEYS if k in r and r[k]), None)
-
-    # Handle "Artist - Track" format
-    if (not artist or not track) and track and " - " in track:
-        left, right = track.split(" - ", 1)
-        artist = artist or left.strip()
-        track = right.strip()
-
-    # Use only primary artist if multiple
-    if artist and "," in artist:
-        artist = artist.split(",")[0].strip()
-
-    return (track, artist) if track and artist else (None, None)
-
-def process_csv(path):
-    """Process CSV file and download all tracks"""
-    path = clean_path(path)
-    
-    if not os.path.exists(path):
-        print(f"\n[ERROR] File not found: {path}")
-        return
-    
-    csv_name = clean_name(os.path.splitext(os.path.basename(path))[0])
-    out = os.path.join(DIRS["CSV"], csv_name)
-    os.makedirs(out, exist_ok=True)
-
-    tracks = []
-    try:
-        with open(path, encoding="utf-8-sig", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                t, a = extract_track_artist(row)
-                if t and a:
-                    tracks.append((t, a))
-    except Exception as e:
-        print(f"\n[ERROR] Failed to read CSV: {e}")
-        return
-
-    if not tracks:
-        print("\n[ERROR] No usable tracks found in CSV.")
-        return
-
-    # Fetch metadata for preview
-    print(f"\n[INFO] Fetching metadata for {len(tracks)} tracks...")
-    tracks_with_meta = []
-    
-    for i, (t, a) in enumerate(tracks, 1):
-        print(f"\r[{i}/{len(tracks)}] Fetching metadata...", end="", flush=True)
-        meta = spotify_meta(t, a)
-        if meta:
-            tracks_with_meta.append((t, a, meta))
-        else:
-            tracks_with_meta.append((t, a, None))
-    
-    print()  # New line after progress
-
-    print("\n========== CSV PREVIEW ==========")
-    for i, (t, a, meta) in enumerate(tracks_with_meta, 1):
-        if meta:
-            print(f"[{i}] {meta['artist']} - {meta['track']} ({meta['album']}, {meta['year']})")
-        else:
-            print(f"[{i}] {a} - {t} [NO METADATA FOUND]")
-
-    remove = input("\nTracks to remove (comma-separated numbers, Enter for none): ").strip()
-    if remove:
-        try:
-            bad = {int(x.strip())-1 for x in remove.split(",") if x.strip().isdigit()}
-            tracks_with_meta = [t for i, t in enumerate(tracks_with_meta) if i not in bad]
-        except ValueError:
-            print("\n[WARNING] Invalid input, proceeding with all tracks")
-
-    if not tracks_with_meta:
-        print("\n[ERROR] No tracks remaining after removal")
-        return
-
-    if input(f"\nDownload {len(tracks_with_meta)} tracks? [Y/N]: ").strip().lower() != "y":
-        return
-
-    print(f"\n[INFO] Downloading to: {out}\n")
-    
-    # Track failed downloads
-    failed_downloads = []
-    
-    for i, (t, a, meta) in enumerate(tracks_with_meta, 1):
-        print(f"\n{'='*60}")
-        print(f"[{i}/{len(tracks_with_meta)}] Processing: {a} - {t}")
-        print('='*60)
-        result = download_track(t, a, out, ask=False)
-        
-        if not result["success"]:
-            failed_downloads.append({
-                "track": result["track"],
-                "artist": result["artist"],
-                "reason": result["reason"]
-            })
-    
-    # Write failed downloads log
-    if failed_downloads:
-        log_file = os.path.join(out, f"_FAILED_DOWNLOADS_{csv_name}.txt")
-        with open(log_file, 'w', encoding='utf-8') as f:
-            f.write(f"Failed Downloads Log - {csv_name}\n")
-            f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Failed: {len(failed_downloads)}/{len(tracks_with_meta)}\n")
-            f.write("="*60 + "\n\n")
-            
-            for item in failed_downloads:
-                f.write(f"Track: {item['track']}\n")
-                f.write(f"Artist: {item['artist']}\n")
-                f.write(f"Reason: {item['reason']}\n")
-                f.write("-"*60 + "\n")
-        
-        print(f"\n{'='*60}")
-        print(f"[WARNING] {len(failed_downloads)} track(s) failed to download")
-        print(f"[INFO] Failed downloads log saved to:")
-        print(f"       {log_file}")
-        print('='*60)
-    else:
-        print(f"\n{'='*60}")
-        print(f"[SUCCESS] All tracks downloaded successfully!")
-        print('='*60)
-
-# ==================== DOWNLOAD TRACK =====================
-
-def download_track(track, artist, out_dir=None, ask=True):
-    """Download track from YouTube with Spotify metadata"""
-    meta = spotify_meta(track, artist)
+def download_audio(url, track, artist, out_dir, meta=None):
+    """Core download function - downloads and tags audio"""
     if not meta:
-        print(f"\n[SKIP] Could not find metadata for: {artist} - {track}")
-        return {"success": False, "reason": "No Spotify metadata found", "track": track, "artist": artist}
-
-    expected = int(meta["duration"])
-    tolerance = 15  # Increased from 6 to 15 seconds for better matching
-
-    if ask:
-        print("\n[PREVIEW]")
-        print(f"  Track: {meta['track']}")
-        print(f"  Artist: {meta['artist']}")
-        print(f"  Album: {meta['album']} ({meta['year']})")
-        print(f"  Duration: {expected}s")
-
-        if input("\nDownload? [Y/N]: ").strip().lower() != "y":
-            return {"success": False, "reason": "User cancelled", "track": track, "artist": artist}
-
-    out_dir = out_dir or DIRS["SINGLE"]
+        meta = spotify_meta(track, artist)
+        if not meta:
+            return {"success": False, "reason": "No metadata", "track": track, "artist": artist}
+    
     base = clean_name(f"{meta['track']} - {meta['artist']}")
     final = os.path.join(out_dir, base + ".mp3")
     
-    # Skip if already exists
     if os.path.exists(final):
-        print(f"\n[SKIP] File already exists: {base}.mp3")
+        print(f"{Fore.YELLOW}[SKIP]{Style.RESET_ALL} Already exists: {base}.mp3")
         return {"success": True, "reason": "Already exists", "track": meta['track'], "artist": meta['artist']}
     
     outtmpl = os.path.join(out_dir, base + ".%(ext)s")
-
+    
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": outtmpl,
@@ -551,1069 +228,1181 @@ def download_track(track, artist, out_dir=None, ask=True):
         "logger": yt_logger(),
         "noplaylist": True,
         "progress_hooks": [progress_hook],
-
-        # 🔑 CRITICAL 403 FIXES
         "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.youtube.com/"
         },
         "force_ipv4": True,
         "concurrent_fragment_downloads": 1,
-
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "0",
-        }],
+        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}],
+        "ignoreerrors": True,
+        "no_color": True
     }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # Try multiple search strategies
-            search_queries = [
-                f"ytsearch15:{meta['track']} {meta['artist']} official audio",  # Increased to 15 results
-                f"ytsearch15:{meta['track']} {meta['artist']} audio",
-                f"ytsearch15:{meta['track']} {meta['artist']} lyrics",
-            ]
-            
-            for search_query in search_queries:
-                info = ydl.extract_info(search_query, download=False)
-
-                if not info or "entries" not in info:
-                    continue
-
-                for entry in info["entries"]:
-                    dur = entry.get("duration")
-                    title = entry.get("title", "")
-                    
-                    if not dur:
-                        continue
-                    
-                    # 🚫 SKIP MUSIC VIDEOS
-                    video_keywords = ["music video", "official video", "official music video", "(official video)"]
-                    if any(keyword in title.lower() for keyword in video_keywords):
-                        print(f"[SKIP] Music video detected: {title}")
-                        continue
-
-                    if abs(dur - expected) <= tolerance:
-                        print(f"\n[MATCH] {entry['title']} ({dur}s)")
-                        try:
-                            ydl.download([entry["webpage_url"]])
-                            
-                            # Verify file was created
-                            if os.path.exists(final):
-                                # Fetch lyrics if Genius API is configured
-                                lyrics = None
-                                if genius:
-                                    print(f"[INFO] Fetching lyrics...")
-                                    lyrics = get_lyrics(meta['track'], meta['artist'])
-                                
-                                embed(final, meta, lyrics)
-                                print(f"[SUCCESS] Downloaded: {base}.mp3")
-                                return {"success": True, "reason": "Downloaded successfully", "track": meta['track'], "artist": meta['artist']}
-                            
-                        except yt_dlp.utils.DownloadError as e:
-                            print(f"\n[ERROR] Download blocked: {e}")
-                            print("[INFO] Trying next match...")
-                            continue
-                    else:
-                        if abs(dur - expected) <= tolerance + 10:  # Show near misses
-                            print(f"[SKIP] Near miss: {entry['title']} ({dur}s vs {expected}s expected, diff: {abs(dur - expected)}s)")
-
-            print(f"\n[FAIL] Could not find official audio for: {track}")
-            return {"success": False, "reason": f"No match found (expected duration: {expected}s)", "track": track, "artist": artist}
-            
-    except Exception as e:
-        print(f"\n[ERROR] Download failed: {e}")
-        return {"success": False, "reason": f"Error: {str(e)}", "track": track, "artist": artist}
-
-# ==================== URL DOWNLOAD =======================
-
-def download_url(url, out_dir=None):
-    """Download audio from direct URL with metadata matching and duration check"""
-    out_dir = out_dir or DIRS["SINGLE"]  # Changed from URLS to SINGLE
     
-    # First, extract info to get title and artist
     try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-            print(f"\n[INFO] Extracting video information...")
-            info = ydl.extract_info(url, download=False)
-            
-            if not info:
-                print("[ERROR] Could not extract video information")
-                return False
-            
-            video_title = info.get("title", "")
-            video_duration = info.get("duration", 0)
-            
-            # 🚫 CHECK FOR MUSIC VIDEO
-            video_keywords = ["music video", "official video", "official music video", "(official video)", "[official video]"]
-            if any(keyword in video_title.lower() for keyword in video_keywords):
-                print(f"\n[WARNING] This appears to be a MUSIC VIDEO: {video_title}")
-                print("[WARNING] Music videos may have intro/outro and different audio quality")
-                if input("\nContinue anyway? [Y/N]: ").strip().lower() != "y":
-                    return False
-            
-            print(f"[INFO] Video: {video_title}")
-            print(f"[INFO] Duration: {video_duration}s")
-            
-            # Try to parse artist and track from title
-            # Common formats: "Artist - Track", "Track - Artist", "Artist: Track"
-            track, artist = None, None
-            
-            # Try different separators
-            for sep in [" - ", " – ", ": ", " | "]:
-                if sep in video_title:
-                    parts = video_title.split(sep, 1)
-                    # Assume first part is artist, second is track
-                    artist = parts[0].strip()
-                    track = parts[1].strip()
-                    # Remove common suffixes
-                    for suffix in ["(Official Audio)", "(Official Video)", "(Lyrics)", "(Audio)", "[Official]"]:
-                        track = track.replace(suffix, "").strip()
-                        artist = artist.replace(suffix, "").strip()
-                    break
-            
-            # If we couldn't parse, ask user
-            if not track or not artist:
-                print("\n[INFO] Could not auto-detect track and artist")
-                track = input("Enter track name: ").strip()
-                artist = input("Enter artist name: ").strip()
-                
-                if not track or not artist:
-                    print("[ERROR] Track and artist are required")
-                    return False
-            
-            # Get Spotify metadata for proper naming and tagging
-            meta = spotify_meta(track, artist)
-            
-            if not meta:
-                print(f"\n[WARNING] Could not find Spotify metadata")
-                print(f"[INFO] Using video title for naming")
-                base = clean_name(f"{track} - {artist}")
-                
-                # Create minimal metadata
-                meta = {
-                    "track": track,
-                    "artist": artist,
-                    "album": "Unknown Album",
-                    "album_artist": artist,
-                    "track_no": 1,
-                    "disc_no": 1,
-                    "year": "2024",
-                    "art": None,
-                    "duration": video_duration
-                }
-            else:
-                base = clean_name(f"{meta['track']} - {meta['artist']}")
-                expected_duration = int(meta["duration"])
-                tolerance = 10
-                
-                # Check duration match
-                if abs(video_duration - expected_duration) > tolerance:
-                    print(f"\n[WARNING] Duration mismatch!")
-                    print(f"  Video: {video_duration}s")
-                    print(f"  Expected: {expected_duration}s")
-                    print(f"  Difference: {abs(video_duration - expected_duration)}s")
-                    
-                    if input("\nContinue anyway? [Y/N]: ").strip().lower() != "y":
-                        return False
-            
-            final = os.path.join(out_dir, base + ".mp3")
-            
-            # Skip if already exists
-            if os.path.exists(final):
-                print(f"\n[SKIP] File already exists: {base}.mp3")
-                return True
-            
-            print(f"\n[INFO] Will save as: {base}.mp3")
-            
-            if input("\nDownload? [Y/N]: ").strip().lower() != "y":
-                return False
-            
-            outtmpl = os.path.join(out_dir, base + ".%(ext)s")
-            
-            ydl_opts = {
-                "format": "bestaudio/best",
-                "outtmpl": outtmpl,
-                "quiet": True,
-                "no_warnings": True,
-                "progress_hooks": [progress_hook],
-                
-                # 🔑 CRITICAL 403 FIXES
-                "http_headers": {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "https://www.youtube.com/"
-                },
-                "force_ipv4": True,
-                "concurrent_fragment_downloads": 1,
-                
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "0",
-                }],
-            }
-            
+        # Suppress stderr output
+        import io
+        import contextlib
+        
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                print(f"\n[INFO] Downloading...")
                 ydl.download([url])
-                
-                # Verify file was created
-                if os.path.exists(final):
-                    # Fetch lyrics if Genius API is configured
-                    lyrics = None
-                    if genius:
-                        print(f"[INFO] Fetching lyrics...")
-                        lyrics = get_lyrics(meta['track'], meta['artist'])
-                    
-                    # Add metadata tags
-                    embed(final, meta, lyrics)
-                    print(f"\n[SUCCESS] Downloaded: {base}.mp3")
-                    print(f"[INFO] Location: {out_dir}")
-                    return True
-                else:
-                    print(f"\n[ERROR] File was not created")
-                    return False
-                    
+        
+        if os.path.exists(final):
+            lyrics = get_lyrics(meta['track'], meta['artist']) if genius else None
+            embed(final, meta, lyrics)
+            print(f"\n{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} {base}.mp3")
+            return {"success": True, "reason": "Downloaded", "track": meta['track'], "artist": meta['artist']}
     except Exception as e:
-        print(f"\n[ERROR] Failed to download URL: {e}")
-        return False
+        print(f"\n{Fore.RED}[ERROR]{Style.RESET_ALL} {e}")
+    
+    return {"success": False, "reason": "Download failed", "track": track, "artist": artist}
 
-# ==================== TXT PROCESSING =====================
+def find_best_youtube(track, artist, expected_duration):
+    """Find best YouTube match using smart scoring"""
+    best_match = None
+    best_score = -1
+    tolerance = 15
+    
+    search_queries = [
+        f"ytsearch20:{track} {artist} official audio",
+        f"ytsearch20:{track} {artist} audio",
+        f"ytsearch20:{track} {artist} lyrics",
+    ]
+    
+    for query in search_queries:
+        try:
+            import io
+            import contextlib
+            
+            stderr_buffer = io.StringIO()
+            with contextlib.redirect_stderr(stderr_buffer):
+                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": yt_logger(), "no_color": True}) as ydl:
+                    info = ydl.extract_info(query, download=False)
+                    if not info or "entries" not in info:
+                        continue
+                    
+                    for entry in info["entries"]:
+                        dur = entry.get("duration")
+                        title = entry.get("title", "").lower()
+                        
+                        if not dur:
+                            continue
+                        
+                        # Skip music videos
+                        if any(kw in title for kw in ["music video", "official video", "(official video)"]):
+                            continue
+                        
+                        duration_diff = abs(dur - expected_duration)
+                        if duration_diff > tolerance:
+                            continue
+                        
+                        # Score calculation
+                        score = 1000 - (duration_diff * 50)
+                        if "official audio" in title: score += 200
+                        elif "audio" in title: score += 100
+                        if "lyrics" in title: score += 50
+                        if track.lower() in title: score += 100
+                        if artist.lower() in title: score += 100
+                        if "cover" in title: score -= 300
+                        if "remix" in title and "remix" not in track.lower(): score -= 300
+                        if "live" in title and "live" not in track.lower(): score -= 200
+                        if "instrumental" in title: score -= 400
+                        if "karaoke" in title: score -= 500
+                        
+                        if score > best_score:
+                            best_score = score
+                            best_match = entry
+            
+            if best_match and best_score >= 800:
+                break
+        except:
+            continue
+    
+    if best_match:
+        dur = best_match.get("duration")
+        diff = abs(dur - expected_duration)
+        print(f"{Fore.GREEN}[BEST MATCH]{Style.RESET_ALL} {best_match['title']} ({dur}s, Δ{diff}s, score: {int(best_score)})")
+        return best_match["webpage_url"]
+    
+    print(f"{Fore.RED}[NO MATCH]{Style.RESET_ALL} No suitable audio found")
+    return None
 
-def process_urls_txt(path):
-    """Process text file containing URLs (one per line)"""
-    path = clean_path(path)
-    
-    if not os.path.exists(path):
-        print(f"\n[ERROR] File not found: {path}")
-        return
-    
-    # Create output directory based on txt filename
-    txt_name = clean_name(os.path.splitext(os.path.basename(path))[0])
-    out_dir = os.path.join(DIRS["URLS_TXT"], txt_name)
-    os.makedirs(out_dir, exist_ok=True)
-    
+def search_youtube_videos(query, limit=5):
+    """Search YouTube and return top results for user selection"""
     try:
-        with open(path, 'r', encoding='utf-8') as f:
-            urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        import io
+        import contextlib
         
-        if not urls:
-            print("\n[ERROR] No URLs found in file")
-            return
+        search_query = f"ytsearch{limit}:{query}"
         
-        # Extract info for all URLs first (for preview)
-        print(f"\n[INFO] Extracting information from {len(urls)} URLs...")
-        tracks_info = []
-        
-        for i, url in enumerate(urls, 1):
-            try:
-                print(f"\r[{i}/{len(urls)}] Processing URL info...", end="", flush=True)
-                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info:
-                        video_title = info.get("title", "Unknown")
-                        video_duration = info.get("duration", 0)
-                        
-                        # Try to parse artist and track from title
-                        track, artist = None, None
-                        for sep in [" - ", " – ", ": ", " | "]:
-                            if sep in video_title:
-                                parts = video_title.split(sep, 1)
-                                artist = parts[0].strip()
-                                track = parts[1].strip()
-                                # Remove common suffixes
-                                for suffix in ["(Official Audio)", "(Official Video)", "(Lyrics)", "(Audio)", "[Official]", "(Official Music Video)"]:
-                                    track = track.replace(suffix, "").strip()
-                                    artist = artist.replace(suffix, "").strip()
-                                break
-                        
-                        if not track or not artist:
-                            track = video_title
-                            artist = "Unknown Artist"
-                        
-                        tracks_info.append({
-                            "url": url,
-                            "track": track,
-                            "artist": artist,
-                            "duration": video_duration,
-                            "title": video_title
-                        })
-            except Exception as e:
-                print(f"\n[WARNING] Could not extract info from URL {i}: {e}")
-                tracks_info.append({
-                    "url": url,
-                    "track": f"Unknown Track {i}",
-                    "artist": "Unknown Artist",
-                    "duration": 0,
-                    "title": "Failed to extract",
-                    "error": str(e)
-                })
-                continue
-        
-        print()  # New line after progress
-        
-        if not tracks_info:
-            print("\n[ERROR] Could not extract info from any URLs")
-            return
-        
-        # Show preview
-        print("\n========== URLS TXT PREVIEW ==========")
-        for i, info in enumerate(tracks_info, 1):
-            if "error" in info:
-                print(f"[{i}] ERROR: {info['title']}")
-            else:
-                print(f"[{i}] {info['artist']} - {info['track']} ({info['duration']}s)")
-        
-        # Option to remove tracks
-        remove = input("\nTracks to remove (comma-separated numbers, Enter for none): ").strip()
-        if remove:
-            try:
-                bad = {int(x.strip())-1 for x in remove.split(",") if x.strip().isdigit()}
-                tracks_info = [t for i, t in enumerate(tracks_info) if i not in bad]
-            except ValueError:
-                print("\n[WARNING] Invalid input, proceeding with all tracks")
-        
-        if not tracks_info:
-            print("\n[ERROR] No tracks remaining after removal")
-            return
-        
-        if input(f"\nDownload {len(tracks_info)} tracks? [Y/N]: ").strip().lower() != "y":
-            return
-        
-        print(f"\n[INFO] Downloading to: {out_dir}\n")
-        
-        # Track failed downloads
-        failed_downloads = []
-        
-        # Download all tracks without asking Y/N for each
-        for i, info in enumerate(tracks_info, 1):
-            print(f"\n{'='*60}")
-            print(f"[{i}/{len(tracks_info)}] {info['artist']} - {info['track']}")
-            print('='*60)
-            
-            if "error" in info:
-                failed_downloads.append({
-                    "track": info['track'],
-                    "artist": info['artist'],
-                    "url": info['url'],
-                    "reason": f"Failed to extract info: {info['error']}"
-                })
-                print(f"[SKIP] Could not extract info from URL")
-                continue
-            
-            result = download_url_direct(info["url"], info["track"], info["artist"], out_dir)
-            
-            if not result:
-                failed_downloads.append({
-                    "track": info['track'],
-                    "artist": info['artist'],
-                    "url": info['url'],
-                    "reason": "Download failed"
-                })
-        
-        # Write failed downloads log
-        if failed_downloads:
-            log_file = os.path.join(out_dir, f"_FAILED_DOWNLOADS_{txt_name}.txt")
-            with open(log_file, 'w', encoding='utf-8') as f:
-                f.write(f"Failed Downloads Log - {txt_name}\n")
-                f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write(f"Total Failed: {len(failed_downloads)}/{len(tracks_info)}\n")
-                f.write("="*60 + "\n\n")
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": yt_logger(), "no_color": True}) as ydl:
+                info = ydl.extract_info(search_query, download=False)
                 
-                for item in failed_downloads:
-                    f.write(f"Track: {item['track']}\n")
-                    f.write(f"Artist: {item['artist']}\n")
-                    f.write(f"URL: {item['url']}\n")
-                    f.write(f"Reason: {item['reason']}\n")
-                    f.write("-"*60 + "\n")
-            
-            print(f"\n{'='*60}")
-            print(f"[WARNING] {len(failed_downloads)} track(s) failed to download")
-            print(f"[INFO] Failed downloads log saved to:")
-            print(f"       {log_file}")
-            print('='*60)
-        else:
-            print(f"\n{'='*60}")
-            print(f"[SUCCESS] All tracks downloaded successfully!")
-            print('='*60)
-            
+                if not info or "entries" not in info:
+                    return []
+                
+                results = []
+                for entry in info["entries"]:
+                    if entry:
+                        results.append({
+                            "title": entry.get("title", "Unknown"),
+                            "url": entry.get("webpage_url", ""),
+                            "duration": entry.get("duration", 0),
+                            "channel": entry.get("channel", "Unknown")
+                        })
+                
+                return results
     except Exception as e:
-        print(f"\n[ERROR] Failed to process file: {e}")
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} YouTube search failed: {e}")
+        return []
 
+# ======================= DOWNLOAD OPTIONS ====================
 
-def download_url_direct(url, track, artist, out_dir):
-    """Download from URL without preview prompts (used by process_urls_txt)"""
-    # Get Spotify metadata for proper naming and tagging
+def download_track(track, artist, out_dir=None, ask=True):
+    """Download single track with YouTube fallback if Spotify fails"""
     meta = spotify_meta(track, artist)
     
     if not meta:
-        print(f"[WARNING] Could not find Spotify metadata, using parsed names")
-        base = clean_name(f"{track} - {artist}")
-        meta = {
-            "track": track,
-            "artist": artist,
-            "album": "Unknown Album",
-            "album_artist": artist,
-            "track_no": 1,
-            "disc_no": 1,
-            "year": "2024",
-            "art": None,
-            "duration": 0
-        }
-    else:
-        base = clean_name(f"{meta['track']} - {meta['artist']}")
-    
-    final = os.path.join(out_dir, base + ".mp3")
-    
-    # Skip if already exists
-    if os.path.exists(final):
-        print(f"[SKIP] File already exists: {base}.mp3")
-        return True
-    
-    outtmpl = os.path.join(out_dir, base + ".%(ext)s")
-    
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [progress_hook],
+        # YouTube fallback for non-Spotify tracks
+        print(f"\n{Fore.YELLOW}[NO SPOTIFY MATCH]{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Searching YouTube directly...")
         
-        # 🔑 CRITICAL 403 FIXES + NO MUSIC VIDEOS
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.youtube.com/"
-        },
-        "force_ipv4": True,
-        "concurrent_fragment_downloads": 1,
+        # Search YouTube
+        search_query = f"{track} {artist}"
+        results = search_youtube_videos(search_query, limit=5)
         
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "0",
-        }],
-    }
+        if not results:
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No YouTube results found")
+            return {"success": False, "reason": "No results found", "track": track, "artist": artist}
+        
+        # Show results
+        print(f"\n{Fore.CYAN}{'='*60}")
+        print(f"YOUTUBE SEARCH RESULTS")
+        print(f"{'='*60}{Style.RESET_ALL}")
+        
+        for i, video in enumerate(results, 1):
+            duration_min = video['duration'] // 60
+            duration_sec = video['duration'] % 60
+            print(f"{Fore.WHITE}[{i}] {video['title']}{Style.RESET_ALL}")
+            print(f"    Channel: {video['channel']}")
+            print(f"    Duration: {duration_min}:{duration_sec:02d}")
+            print()
+        
+        choice = input(f"{Fore.CYAN}Select [1-{len(results)}] or 0 to cancel: {Style.RESET_ALL}").strip()
+        
+        if choice == "0" or not choice.isdigit():
+            return {"success": False, "reason": "Cancelled", "track": track, "artist": artist}
+        
+        idx = int(choice) - 1
+        if idx < 0 or idx >= len(results):
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Invalid choice")
+            return {"success": False, "reason": "Invalid choice", "track": track, "artist": artist}
+        
+        selected = results[idx]
+        
+        # Download with basic metadata (no Spotify)
+        out_dir = out_dir or DIRS["SINGLE"]
+        return download_url(selected['url'], out_dir)
+    
+    # Continue with normal Spotify flow
+    if ask:
+        print(f"\n{Fore.CYAN}[PREVIEW]{Style.RESET_ALL}")
+        print(f"  Track: {meta['track']}")
+        print(f"  Artist: {meta['artist']}")
+        print(f"  Album: {meta['album']} ({meta['year']})")
+        if input(f"\n{Fore.CYAN}Download? [Y/N]: {Style.RESET_ALL}").strip().lower() != "y":
+            return {"success": False, "reason": "Cancelled", "track": track, "artist": artist}
+    
+    out_dir = out_dir or DIRS["SINGLE"]
+    url = find_best_youtube(track, artist, int(meta["duration"]))
+    
+    if not url:
+        return {"success": False, "reason": "No YouTube match", "track": track, "artist": artist}
+    
+    return download_audio(url, track, artist, out_dir, meta)
+
+def download_url(url, out_dir=None):
+    """Download from direct URL"""
+    out_dir = out_dir or DIRS["SINGLE"]
     
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            
-            if os.path.exists(final):
-                # Fetch lyrics if Genius API is configured
-                lyrics = None
-                if genius:
-                    print(f"[INFO] Fetching lyrics...")
-                    lyrics = get_lyrics(meta['track'], meta['artist'])
+        import io
+        import contextlib
+        
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": yt_logger(), "no_color": True}) as ydl:
+                print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Extracting info...")
+                info = ydl.extract_info(url, download=False)
+                title = info.get("title", "Unknown")
                 
-                embed(final, meta, lyrics)
-                print(f"[SUCCESS] Downloaded: {base}.mp3")
-                return True
-            else:
-                print(f"[ERROR] File was not created")
-                return False
+                # Parse track/artist from title
+                if " - " in title:
+                    parts = title.split(" - ", 1)
+                    artist, track = parts[0].strip(), parts[1].strip()
+                else:
+                    track, artist = title, "Unknown"
+                
+                # Clean up common suffixes from BOTH track and artist
+                cleanup_patterns = [
+                    "(Official Video)", "(Official Audio)", "(Official Music Video)",
+                    "[Official Video]", "[Official Audio]", "[Official Music Video]",
+                    "(Lyrics)", "[Lyrics]", "(Lyric Video)", "[Lyric Video]",
+                    "(Official Lyric Video)", "[Official Lyric Video]",
+                    "(Audio)", "[Audio]", "(Visualizer)", "[Visualizer]",
+                    "(Official Visualizer)", "[Official Visualizer]",
+                    "(Music Video)", "[Music Video]", "(HD)", "[HD]",
+                    "(4K)", "[4K]", "(Live)", "[Live]"
+                ]
+                
+                for pattern in cleanup_patterns:
+                    track = track.replace(pattern, "").strip()
+                    artist = artist.replace(pattern, "").strip()
+                
+                # Remove featuring artists from track name for better Spotify matching
+                # Keep original for metadata, but search without "ft."
+                track_for_search = track
+                
+                # Remove featuring patterns: "ft.", "feat.", "featuring"
+                feat_patterns = [
+                    r'\s+ft\.?\s+.*',  # " ft. Artist"
+                    r'\s+feat\.?\s+.*',  # " feat. Artist"
+                    r'\s+featuring\s+.*',  # " featuring Artist"
+                    r'\s+\(ft\.?.*?\)',  # " (ft. Artist)"
+                    r'\s+\[ft\.?.*?\]',  # " [ft. Artist]"
+                    r'\s+\(feat\.?.*?\)',  # " (feat. Artist)"
+                    r'\s+\[feat\.?.*?\]',  # " [feat. Artist]"
+                ]
+                
+                for pattern in feat_patterns:
+                    track_for_search = re.sub(pattern, '', track_for_search, flags=re.IGNORECASE).strip()
+                
+                print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Parsed: {track} by {artist}")
+                if track_for_search != track:
+                    print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Searching as: {track_for_search} by {artist}")
+                
+                # Try to get Spotify metadata (use cleaned track name for search)
+                meta = spotify_meta(track_for_search, artist)
+                
+                if meta:
+                    # Download with full metadata (use Spotify's proper track name)
+                    print(f"{Fore.GREEN}[INFO]{Style.RESET_ALL} Using Spotify metadata")
+                    return download_audio(url, track_for_search, artist, out_dir, meta)
+                else:
+                    # Download without Spotify - just use basic info
+                    print(f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} Downloading with basic metadata (no Spotify match)")
+                    
+                    # Use cleaned track name for filename
+                    base = clean_name(f"{track_for_search} - {artist}")
+                    final = os.path.join(out_dir, base + ".mp3")
+                    
+                    if os.path.exists(final):
+                        print(f"{Fore.YELLOW}[SKIP]{Style.RESET_ALL} Already exists: {base}.mp3")
+                        return {"success": True, "reason": "Already exists", "track": track_for_search, "artist": artist}
+                    
+                    outtmpl = os.path.join(out_dir, base + ".%(ext)s")
+                    
+                    ydl_opts = {
+                        "format": "bestaudio/best",
+                        "outtmpl": outtmpl,
+                        "quiet": True,
+                        "no_warnings": True,
+                        "logger": yt_logger(),
+                        "progress_hooks": [progress_hook],
+                        "http_headers": {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            "Accept-Language": "en-US,en;q=0.9",
+                            "Referer": "https://www.youtube.com/"
+                        },
+                        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "0"}],
+                    }
+                    
+                    try:
+                        with yt_dlp.YoutubeDL(ydl_opts) as ydl2:
+                            ydl2.download([url])
+                            
+                            if os.path.exists(final):
+                                # Add basic metadata
+                                try:
+                                    tags = ID3(final)
+                                except ID3NoHeaderError:
+                                    tags = ID3()
+                                
+                                tags["TIT2"] = TIT2(encoding=3, text=track_for_search)
+                                tags["TPE1"] = TPE1(encoding=3, text=artist)
+                                
+                                # Try to get YouTube thumbnail as artwork
+                                thumbnail_url = info.get("thumbnail")
+                                if thumbnail_url:
+                                    try:
+                                        print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Downloading thumbnail...")
+                                        img_data = requests.get(thumbnail_url, timeout=10).content
+                                        tags.delall("APIC")
+                                        tags.add(APIC(encoding=3, mime="image/jpeg", type=3, data=img_data))
+                                        print(f"{Fore.GREEN}[✓]{Style.RESET_ALL} Thumbnail embedded")
+                                    except Exception as e:
+                                        print(f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} Couldn't download thumbnail")
+                                
+                                tags.save(final)
+                                
+                                print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} {base}.mp3")
+                                return {"success": True, "reason": "Downloaded", "track": track_for_search, "artist": artist}
+                    except Exception as e:
+                        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Download failed: {e}")
+                        return {"success": False, "reason": str(e), "track": track_for_search, "artist": artist}
                 
     except Exception as e:
-        print(f"[ERROR] Failed to download: {e}")
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {e}")
         return False
 
-# ==================== ALBUM DOWNLOAD =====================
-
-def download_album(album_input=None):
-    """Download entire Spotify album - supports name+artist, ID, or URL"""
+def process_batch(items, out_dir, item_type="track"):
+    """Generic batch processor"""
+    failed = []
     
-    # If no input provided, ask user for input method
-    if not album_input:
-        print("\n========== SPOTIFY ALBUM DOWNLOAD ==========")
-        print("1. Search by Album Name + Artist")
-        print("2. Enter Album ID")
-        print("3. Enter Spotify URL")
+    for i, item in enumerate(items, 1):
+        print(f"\n{'='*60}")
+        print(f"[{i}/{len(items)}] Processing...")
+        print('='*60)
         
-        choice = input("\nSelect input method [1-3]: ").strip()
+        if item_type == "track":
+            track, artist = item
+            result = download_track(track, artist, out_dir, ask=False)
+        else:  # URL
+            result = download_url(item, out_dir)
         
-        if choice == "1":
-            # Search by name and artist
-            album_name = input("\nAlbum name: ").strip()
-            artist_name = input("Artist name: ").strip()
+        if isinstance(result, dict) and not result["success"]:
+            failed.append(result)
+    
+    return failed
+
+def write_failed_log(failed, out_dir, name):
+    """Write failed downloads log"""
+    if not failed:
+        print(f"\n{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} All downloads completed!")
+        return
+    
+    log_file = os.path.join(out_dir, f"_FAILED_DOWNLOADS_{clean_name(name)}.txt")
+    with open(log_file, 'w', encoding='utf-8') as f:
+        f.write(f"Failed Downloads - {name}\n")
+        f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Total: {len(failed)}\n")
+        f.write("="*60 + "\n\n")
+        
+        for item in failed:
+            f.write(f"Track: {item.get('track', 'N/A')}\n")
+            f.write(f"Artist: {item.get('artist', 'N/A')}\n")
+            f.write(f"Reason: {item['reason']}\n")
+            f.write("-"*60 + "\n")
+    
+    print(f"\n{Fore.YELLOW}[WARNING]{Style.RESET_ALL} {len(failed)} failed")
+    print(f"{Fore.CYAN}[LOG]{Style.RESET_ALL} {log_file}")
+
+# ===================== CSV / TXT / PLAYLISTS ==================
+
+def search_spotify_album(album_name, artist_name):
+    """Search for Spotify album"""
+    if not sp:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Spotify not configured")
+        return None
+    
+    try:
+        # Try multiple search strategies
+        queries = [
+            f'album:"{album_name}" artist:"{artist_name}"',
+            f'{album_name} {artist_name}',
+            album_name
+        ]
+        
+        all_albums = []
+        seen = set()
+        
+        for query in queries:
+            try:
+                results = sp.search(q=query, type="album", limit=10)
+                for album in results["albums"]["items"]:
+                    if album["id"] not in seen:
+                        all_albums.append(album)
+                        seen.add(album["id"])
+            except:
+                continue
+        
+        if not all_albums:
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No albums found")
+            return None
+        
+        # Score and sort
+        def score_album(album):
+            s = 0
+            a_name = album['name'].lower()
+            search = album_name.lower()
+            if a_name == search: s += 100
+            elif search in a_name or a_name in search: s += 50
             
-            if not album_name or not artist_name:
-                print("\n[ERROR] Both album name and artist name are required")
-                return
-            
-            album_id = search_spotify_album(album_name, artist_name)
-            if not album_id:
-                return
-                
-        elif choice == "2":
-            # Direct ID input
-            album_id = input("\nEnter Album ID: ").strip()
-            if not album_id:
-                print("\n[ERROR] Album ID is required")
-                return
-                
-        elif choice == "3":
-            # URL input
-            album_url = input("\nEnter Spotify Album URL: ").strip()
-            if not album_url:
-                print("\n[ERROR] URL is required")
-                return
-            
-            if "spotify.com/album/" in album_url:
-                album_id = album_url.split("album/")[1].split("?")[0]
-            else:
-                print("\n[ERROR] Invalid Spotify album URL")
-                return
-        else:
-            print("\n[ERROR] Invalid selection")
+            for artist in album["artists"]:
+                a_artist = artist["name"].lower()
+                search_artist = artist_name.lower()
+                if a_artist == search_artist: s += 80
+                elif search_artist in a_artist or a_artist in search_artist: s += 40
+            return s
+        
+        scored = [(score_album(a), a) for a in all_albums]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        # Show top 10
+        print(f"\n{Fore.CYAN}=== ALBUM RESULTS ==={Style.RESET_ALL}")
+        for i, (score, album) in enumerate(scored[:10], 1):
+            artists = ", ".join([a["name"] for a in album["artists"]])
+            year = album["release_date"][:4] if album.get("release_date") else "?"
+            tracks = album.get("total_tracks", "?")
+            match = "EXACT" if score >= 150 else "GOOD" if score >= 80 else "MAYBE"
+            color = Fore.GREEN if score >= 150 else Fore.YELLOW if score >= 80 else Fore.WHITE
+            print(f"{color}[{i}] {album['name']} - {artists} ({year}) [{tracks} tracks] ({match}){Style.RESET_ALL}")
+        
+        choice = input(f"\n{Fore.CYAN}Select [1-{min(10, len(scored))}] or 0 to cancel: {Style.RESET_ALL}").strip()
+        if choice == "0":
+            return None
+        if choice.isdigit() and 1 <= int(choice) <= min(10, len(scored)):
+            return scored[int(choice)-1][1]["id"]
+        return None
+    except Exception as e:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {e}")
+        return None
+
+def download_spotify_album(album_id):
+    """Download Spotify album"""
+    if not sp:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Spotify not configured")
+        return
+    
+    try:
+        album = sp.album(album_id)
+        tracks = [(t["name"], t["artists"][0]["name"]) for t in album["tracks"]["items"]]
+        name = album["name"]
+        artist = album["artists"][0]["name"]
+        year = album["release_date"][:4] if album.get("release_date") else "?"
+        
+        out_dir = os.path.join(DIRS["ALBUM"], clean_name(name))
+        os.makedirs(out_dir, exist_ok=True)
+        
+        # Show preview with album info
+        print(f"\n{Fore.CYAN}{'='*60}")
+        print(f"SPOTIFY ALBUM PREVIEW")
+        print(f"{'='*60}{Style.RESET_ALL}")
+        print(f"{Fore.GREEN}Album:{Style.RESET_ALL} {name}")
+        print(f"{Fore.GREEN}Artist:{Style.RESET_ALL} {artist}")
+        print(f"{Fore.GREEN}Year:{Style.RESET_ALL} {year}")
+        print(f"{Fore.GREEN}Tracks:{Style.RESET_ALL} {len(tracks)}\n")
+        
+        for i, (t, a) in enumerate(tracks, 1):
+            print(f"{Fore.GREEN}[{i}]{Style.RESET_ALL} {t}")
+        
+        remove = input(f"\n{Fore.CYAN}Remove tracks (comma-separated, Enter for none): {Style.RESET_ALL}").strip()
+        if remove:
+            try:
+                bad = {int(x.strip())-1 for x in remove.split(",") if x.strip().isdigit()}
+                tracks = [t for i, t in enumerate(tracks) if i not in bad]
+            except:
+                pass
+        
+        if not tracks:
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No tracks remaining")
             return
-    else:
-        # Direct input provided (legacy support)
-        if "spotify.com/album/" in album_input:
-            album_id = album_input.split("album/")[1].split("?")[0]
+        
+        if input(f"\n{Fore.CYAN}Download {len(tracks)} tracks? [Y/N]: {Style.RESET_ALL}").strip().lower() != "y":
+            return
+        
+        print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Downloading to: {out_dir}\n")
+        
+        failed = []
+        for i, (t, a) in enumerate(tracks, 1):
+            print(f"\n{'='*60}")
+            print(f"[{i}/{len(tracks)}] {a} - {t}")
+            print('='*60)
+            result = download_track(t, a, out_dir, ask=False)
+            if not result["success"]:
+                failed.append(result)
+        
+        write_failed_log(failed, out_dir, name)
+    except Exception as e:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {e}")
+
+def process_csv(csv_path):
+    """Process CSV file"""
+    csv_path = clean_path(csv_path)
+    if not os.path.exists(csv_path):
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} File not found")
+        return
+    
+    tracks = []
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        
+        # Strip BOM and whitespace from column names
+        if reader.fieldnames:
+            reader.fieldnames = [col.strip().strip('\ufeff') for col in reader.fieldnames]
+            print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Detected CSV columns: {', '.join(reader.fieldnames)}")
+        
+        row_count = 0
+        for row in reader:
+            row_count += 1
+            
+            # Debug: dump first row completely
+            if row_count == 1:
+                print(f"{Fore.CYAN}[DEBUG]{Style.RESET_ALL} First row contents:")
+                for key, value in row.items():
+                    print(f"  '{key}' = '{value}'")
+            
+            # Try multiple column name variations for track
+            track = (row.get('Track Name') or 
+                    row.get('Track name') or  # TuneMyMusic
+                    row.get('track') or 
+                    row.get('Track') or 
+                    row.get('name') or
+                    row.get('Name'))
+            
+            # Try multiple column name variations for artist
+            # Use strip() to handle empty strings
+            artist = (row.get('Artist Name(s)', '').strip() or
+                     row.get('Artist Name', '').strip() or
+                     row.get('Artist name', '').strip() or  # TuneMyMusic
+                     row.get('Artist', '').strip() or 
+                     row.get('artist', '').strip() or
+                     None)
+            
+            # Handle TuneMyMusic format where artist is in track name
+            if track and not artist and ' - ' in track:
+                # Track name format: "Artist - Song Title"
+                parts = track.split(' - ', 1)
+                artist = parts[0].strip()
+                track = parts[1].strip()
+                
+                # Clean up YouTube suffixes from track name
+                cleanup_patterns = [
+                    "(Official Video)", "(Official Audio)", "(Official Music Video)",
+                    "[Official Video]", "[Official Audio]", "[Official Music Video]",
+                    "(Lyrics)", "[Lyrics]", "(Lyric Video)", "[Lyric Video]",
+                    "(Official Lyric Video)", "[Official Lyric Video]",
+                    "(Audio)", "[Audio]", "(Visualizer)", "[Visualizer]",
+                    "(Official Visualizer)", "[Official Visualizer]",
+                    "(Music Video)", "[Music Video]", "(HD)", "[HD]",
+                    "(4K)", "[4K]", "(Live)", "[Live]"
+                ]
+                
+                for pattern in cleanup_patterns:
+                    track = track.replace(pattern, "").strip()
+                
+                # Remove featuring artists for better Spotify matching
+                import re
+                feat_patterns = [
+                    r'\s+ft\.?\s+.*',
+                    r'\s+feat\.?\s+.*',
+                    r'\s+featuring\s+.*',
+                    r'\s+\(ft\.?.*?\)',
+                    r'\s+\[ft\.?.*?\]',
+                    r'\s+\(feat\.?.*?\)',
+                    r'\s+\[feat\.?.*?\]',
+                    r'\s+\[with\s+.*?\]',
+                ]
+                
+                for pattern in feat_patterns:
+                    track = re.sub(pattern, '', track, flags=re.IGNORECASE).strip()
+                
+                if row_count <= 3:
+                    print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Parsed from track: '{artist}' - '{track}'")
+            
+            if track and artist:
+                tracks.append((track.strip(), artist.strip()))
+            else:
+                if row_count <= 3:  # Show first 3 failed rows
+                    print(f"{Fore.YELLOW}[DEBUG]{Style.RESET_ALL} Row {row_count} skipped - Track: '{track}', Artist: '{artist}'")
+    
+    if not tracks:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No valid tracks in CSV")
+        print(f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} CSV must have columns for track and artist")
+        print(f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} Supported column names:")
+        print(f"  Track: 'Track Name', 'track', 'Track', 'name', 'Name', 'Track name'")
+        print(f"  Artist: 'Artist', 'artist', 'Artist Name', 'Artist name', 'Artist Name(s)'")
+        return
+    
+    csv_name = os.path.splitext(os.path.basename(csv_path))[0]
+    out_dir = os.path.join(DIRS["CSV"], csv_name)
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Fetch metadata for preview
+    print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Fetching metadata for {len(tracks)} tracks...")
+    tracks_with_meta = []
+    for i, (t, a) in enumerate(tracks, 1):
+        print(f"\r{Fore.CYAN}[{i}/{len(tracks)}]{Style.RESET_ALL} Checking: {t[:30]}...", end='', flush=True)
+        meta = spotify_meta(t, a)
+        tracks_with_meta.append((t, a, meta))
+    
+    print()  # New line
+    
+    # Show preview
+    print(f"\n{Fore.CYAN}{'='*60}")
+    print(f"CSV PREVIEW - {csv_name}")
+    print(f"{'='*60}{Style.RESET_ALL}")
+    for i, (t, a, meta) in enumerate(tracks_with_meta, 1):
+        if meta:
+            print(f"{Fore.GREEN}[{i}]{Style.RESET_ALL} {meta['artist']} - {meta['track']} ({meta['album']}, {meta['year']})")
         else:
-            album_id = album_input
+            print(f"{Fore.RED}[{i}]{Style.RESET_ALL} {a} - {t} [NO METADATA]")
     
-    # Fetch album tracks
-    tracks, album_name = spotify_album(album_id)
-    
-    if not tracks:
-        print("\n[ERROR] Could not fetch album")
-        return
-    
-    print(f"\n========== SPOTIFY ALBUM PREVIEW ==========")
-    print(f"Album: {album_name}")
-    print(f"Tracks: {len(tracks)}\n")
-    
-    for i, track in enumerate(tracks, 1):
-        print(f"[{i}] {track['artist']} - {track['name']}")
-    
-    # Option to remove tracks
-    remove = input("\nTracks to remove (comma-separated numbers, Enter for none): ").strip()
+    remove = input(f"\n{Fore.CYAN}Remove tracks (comma-separated, Enter for none): {Style.RESET_ALL}").strip()
     if remove:
         try:
             bad = {int(x.strip())-1 for x in remove.split(",") if x.strip().isdigit()}
-            tracks = [t for i, t in enumerate(tracks) if i not in bad]
-        except ValueError:
-            print("\n[WARNING] Invalid input, proceeding with all tracks")
+            tracks_with_meta = [item for i, item in enumerate(tracks_with_meta) if i not in bad]
+        except:
+            pass
     
-    if not tracks:
-        print("\n[ERROR] No tracks remaining after removal")
+    if not tracks_with_meta:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No tracks remaining")
         return
     
-    if input(f"\nDownload {len(tracks)} tracks? [Y/N]: ").strip().lower() != "y":
+    if input(f"\n{Fore.CYAN}Download {len(tracks_with_meta)} tracks? [Y/N]: {Style.RESET_ALL}").strip().lower() != "y":
         return
     
-    out_dir = os.path.join(DIRS["ALBUM"], clean_name(album_name))
-    os.makedirs(out_dir, exist_ok=True)
+    print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Downloading to: {out_dir}\n")
     
-    print(f"\n[INFO] Downloading to: {out_dir}\n")
-    
-    # Track failed downloads
-    failed_downloads = []
-    
-    for i, track in enumerate(tracks, 1):
+    # Download
+    failed = []
+    for i, (t, a, meta) in enumerate(tracks_with_meta, 1):
         print(f"\n{'='*60}")
-        print(f"[{i}/{len(tracks)}] {track['artist']} - {track['name']}")
+        print(f"[{i}/{len(tracks_with_meta)}] {a} - {t}")
         print('='*60)
-        result = download_track(track["name"], track["artist"], out_dir, ask=False)
+        
+        if meta:
+            # Has Spotify metadata - use the smart download
+            url = find_best_youtube(t, a, int(meta["duration"]))
+            if url:
+                result = download_audio(url, t, a, out_dir, meta)
+            else:
+                result = {"success": False, "reason": "No YouTube match", "track": t, "artist": a}
+        else:
+            # No Spotify metadata - try direct YouTube search and download
+            print(f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} No Spotify metadata, searching YouTube directly...")
+            try:
+                search_query = f"ytsearch1:{t} {a} audio"
+                with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                    info = ydl.extract_info(search_query, download=False)
+                    if info and 'entries' in info and info['entries']:
+                        video_url = info['entries'][0]['webpage_url']
+                        result = download_url(video_url, out_dir)
+                    else:
+                        result = {"success": False, "reason": "No YouTube results", "track": t, "artist": a}
+            except Exception as e:
+                result = {"success": False, "reason": f"Search failed: {str(e)}", "track": t, "artist": a}
         
         if not result["success"]:
-            failed_downloads.append({
-                "track": result["track"],
-                "artist": result["artist"],
-                "reason": result["reason"]
-            })
+            failed.append(result)
     
-    # Write failed downloads log
-    if failed_downloads:
-        log_file = os.path.join(out_dir, f"_FAILED_DOWNLOADS_{clean_name(album_name)}.txt")
-        with open(log_file, 'w', encoding='utf-8') as f:
-            f.write(f"Failed Downloads Log - {album_name}\n")
-            f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Failed: {len(failed_downloads)}/{len(tracks)}\n")
-            f.write("="*60 + "\n\n")
-            
-            for item in failed_downloads:
-                f.write(f"Track: {item['track']}\n")
-                f.write(f"Artist: {item['artist']}\n")
-                f.write(f"Reason: {item['reason']}\n")
-                f.write("-"*60 + "\n")
-        
-        print(f"\n{'='*60}")
-        print(f"[WARNING] {len(failed_downloads)} track(s) failed to download")
-        print(f"[INFO] Failed downloads log saved to:")
-        print(f"       {log_file}")
-        print('='*60)
-    else:
-        print(f"\n{'='*60}")
-        print(f"[SUCCESS] All tracks downloaded successfully!")
-        print('='*60)
+    write_failed_log(failed, out_dir, csv_name)
 
-# ==================== PLAYLIST DOWNLOAD ==================
-
-def download_playlist(playlist_id_or_url):
-    """Download entire Spotify playlist"""
-    # Extract playlist ID from URL if needed
-    if "spotify.com/playlist/" in playlist_id_or_url:
-        playlist_id = playlist_id_or_url.split("playlist/")[1].split("?")[0]
-    else:
-        playlist_id = playlist_id_or_url
-    
-    tracks, playlist_name = spotify_playlist(playlist_id)
-    
-    if not tracks:
-        print("\n[ERROR] Could not fetch playlist")
+def process_urls_txt(txt_path):
+    """Process TXT file with URLs"""
+    txt_path = clean_path(txt_path)
+    if not os.path.exists(txt_path):
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} File not found")
         return
     
-    print(f"\n========== SPOTIFY PLAYLIST PREVIEW ==========")
-    print(f"Playlist: {playlist_name}")
-    print(f"Tracks: {len(tracks)}\n")
+    urls = []
+    with open(txt_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            url = line.strip()
+            if url and url.startswith("http"):
+                urls.append(url)
     
-    for i, track in enumerate(tracks, 1):
-        print(f"[{i}] {track['artist']} - {track['name']}")
+    if not urls:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No URLs found")
+        return
     
-    # Option to remove tracks
-    remove = input("\nTracks to remove (comma-separated numbers, Enter for none): ").strip()
+    txt_name = os.path.splitext(os.path.basename(txt_path))[0]
+    out_dir = os.path.join(DIRS["URLS_TXT"], txt_name)
+    os.makedirs(out_dir, exist_ok=True)
+    
+    # Extract video info for preview
+    print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Extracting info from {len(urls)} URLs...")
+    video_info = []
+    for i, url in enumerate(urls, 1):
+        print(f"\r{Fore.CYAN}[{i}/{len(urls)}]{Style.RESET_ALL} Processing...", end='', flush=True)
+        try:
+            with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                title = info.get("title", "Unknown")
+                
+                # Parse track/artist
+                if " - " in title:
+                    parts = title.split(" - ", 1)
+                    artist, track = parts[0].strip(), parts[1].strip()
+                else:
+                    track, artist = title, "Unknown"
+                
+                # Clean up
+                for suffix in ["(Official Video)", "(Official Audio)", "(Lyrics)", "[Official Video]", "[Official Audio]", "[Lyrics]"]:
+                    track = track.replace(suffix, "").strip()
+                    artist = artist.replace(suffix, "").strip()
+                
+                video_info.append((url, artist, track))
+        except:
+            video_info.append((url, "Unknown", "Failed to extract"))
+    
+    print()  # New line
+    
+    # Show full preview
+    print(f"\n{Fore.CYAN}{'='*60}")
+    print(f"TXT PREVIEW - {txt_name} ({len(video_info)} URLs)")
+    print(f"{'='*60}{Style.RESET_ALL}")
+    for i, (url, artist, track) in enumerate(video_info, 1):
+        print(f"{Fore.WHITE}[{i}] {artist} - {track}{Style.RESET_ALL}")
+    
+    remove = input(f"\n{Fore.CYAN}Remove URLs (comma-separated numbers, Enter for none): {Style.RESET_ALL}").strip()
     if remove:
         try:
             bad = {int(x.strip())-1 for x in remove.split(",") if x.strip().isdigit()}
-            tracks = [t for i, t in enumerate(tracks) if i not in bad]
-        except ValueError:
-            print("\n[WARNING] Invalid input, proceeding with all tracks")
+            video_info = [v for i, v in enumerate(video_info) if i not in bad]
+            print(f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} Removed {len(bad)} URLs, {len(video_info)} remaining")
+        except:
+            pass
     
-    if not tracks:
-        print("\n[ERROR] No tracks remaining after removal")
+    if not video_info:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No URLs remaining")
         return
     
-    if input(f"\nDownload {len(tracks)} tracks? [Y/N]: ").strip().lower() != "y":
+    if input(f"\n{Fore.CYAN}Download {len(video_info)} videos? [Y/N]: {Style.RESET_ALL}").strip().lower() != "y":
         return
     
-    out_dir = os.path.join(DIRS["PLAYLIST"], clean_name(playlist_name))
-    os.makedirs(out_dir, exist_ok=True)
+    print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Downloading to: {out_dir}\n")
     
-    print(f"\n[INFO] Downloading to: {out_dir}\n")
-    
-    # Track failed downloads
-    failed_downloads = []
-    
-    for i, track in enumerate(tracks, 1):
+    # Download each URL
+    failed = []
+    for i, (url, artist, track) in enumerate(video_info, 1):
         print(f"\n{'='*60}")
-        print(f"[{i}/{len(tracks)}] {track['artist']} - {track['name']}")
+        print(f"[{i}/{len(video_info)}] {artist} - {track}")
         print('='*60)
-        result = download_track(track["name"], track["artist"], out_dir, ask=False)
-        
-        if not result["success"]:
-            failed_downloads.append({
-                "track": result["track"],
-                "artist": result["artist"],
-                "reason": result["reason"]
-            })
+        result = download_url(url, out_dir)
+        if isinstance(result, dict) and not result["success"]:
+            failed.append(result)
     
-    # Write failed downloads log
-    if failed_downloads:
-        log_file = os.path.join(out_dir, f"_FAILED_DOWNLOADS_{clean_name(playlist_name)}.txt")
-        with open(log_file, 'w', encoding='utf-8') as f:
-            f.write(f"Failed Downloads Log - {playlist_name}\n")
-            f.write(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Total Failed: {len(failed_downloads)}/{len(tracks)}\n")
-            f.write("="*60 + "\n\n")
-            
-            for item in failed_downloads:
-                f.write(f"Track: {item['track']}\n")
-                f.write(f"Artist: {item['artist']}\n")
-                f.write(f"Reason: {item['reason']}\n")
-                f.write("-"*60 + "\n")
-        
+    write_failed_log(failed, out_dir, txt_name)
+    for i, url in enumerate(urls, 1):
         print(f"\n{'='*60}")
-        print(f"[WARNING] {len(failed_downloads)} track(s) failed to download")
-        print(f"[INFO] Failed downloads log saved to:")
-        print(f"       {log_file}")
+        print(f"[{i}/{len(urls)}] {url}")
         print('='*60)
-    else:
-        print(f"\n{'='*60}")
-        print(f"[SUCCESS] All tracks downloaded successfully!")
-        print('='*60)
+        result = download_url(url, out_dir)
+        if isinstance(result, dict) and not result.get("success"):
+            failed.append(result)
+    
+    write_failed_log(failed, out_dir, txt_name)
 
-# ======================== SETTINGS =======================
+def download_spotify_playlist(playlist_id):
+    """Download Spotify playlist"""
+    if not sp:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Spotify not configured")
+        return
+    
+    try:
+        results = sp.playlist_tracks(playlist_id)
+        tracks = [(item["track"]["name"], item["track"]["artists"][0]["name"]) 
+                  for item in results["items"] if item["track"]]
+        
+        playlist = sp.playlist(playlist_id)
+        name = playlist["name"]
+        
+        out_dir = os.path.join(DIRS["PLAYLIST"], clean_name(name))
+        os.makedirs(out_dir, exist_ok=True)
+        
+        # Show full preview
+        print(f"\n{Fore.CYAN}{'='*60}")
+        print(f"SPOTIFY PLAYLIST PREVIEW - {name} ({len(tracks)} tracks)")
+        print(f"{'='*60}{Style.RESET_ALL}")
+        for i, (t, a) in enumerate(tracks, 1):
+            print(f"{Fore.GREEN}[{i}]{Style.RESET_ALL} {a} - {t}")
+        
+        remove = input(f"\n{Fore.CYAN}Remove tracks (comma-separated, Enter for none): {Style.RESET_ALL}").strip()
+        if remove:
+            try:
+                bad = {int(x.strip())-1 for x in remove.split(",") if x.strip().isdigit()}
+                tracks = [t for i, t in enumerate(tracks) if i not in bad]
+                print(f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} Removed {len(bad)} tracks, {len(tracks)} remaining")
+            except:
+                pass
+        
+        if not tracks:
+            print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No tracks remaining")
+            return
+        
+        if input(f"\n{Fore.CYAN}Download {len(tracks)} tracks? [Y/N]: {Style.RESET_ALL}").strip().lower() != "y":
+            return
+        
+        print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Downloading to: {out_dir}\n")
+        
+        failed = []
+        for i, (t, a) in enumerate(tracks, 1):
+            print(f"\n{'='*60}")
+            print(f"[{i}/{len(tracks)}] {a} - {t}")
+            print('='*60)
+            result = download_track(t, a, out_dir, ask=False)
+            if not result["success"]:
+                failed.append(result)
+        
+        write_failed_log(failed, out_dir, name)
+    except Exception as e:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {e}")
+
+def download_youtube_playlist(playlist_url):
+    """Download YouTube playlist"""
+    try:
+        import io
+        import contextlib
+        
+        stderr_buffer = io.StringIO()
+        with contextlib.redirect_stderr(stderr_buffer):
+            with yt_dlp.YoutubeDL({"quiet": True, "extract_flat": True, "no_warnings": True, "logger": yt_logger(), "no_color": True}) as ydl:
+                info = ydl.extract_info(playlist_url, download=False)
+                if not info or not info.get("entries"):
+                    print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Playlist empty/private")
+                    return
+                
+                name = info.get("title", "YouTube Playlist")
+                entries = info["entries"]
+                
+                print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} {name} ({len(entries)} videos)")
+                print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Parsing video titles...")
+                
+                # Extract and parse video information
+                videos = []
+                for i, entry in enumerate(entries, 1):
+                    if entry:
+                        print(f"\r{Fore.CYAN}[{i}/{len(entries)}]{Style.RESET_ALL} Processing...", end='', flush=True)
+                        video_url = f"https://www.youtube.com/watch?v={entry.get('id')}"
+                        video_title = entry.get("title", "Unknown")
+                        
+                        # Parse artist and track
+                        title = video_title
+                        # Remove common suffixes first
+                        for suffix in ["(Official Video)", "(Official Audio)", "(Official Music Video)", 
+                                      "[Official Video]", "[Official Audio]", "(Lyrics)", "[Lyrics]",
+                                      "(Audio)", "[Audio]", "(Visualizer)", "[Visualizer]"]:
+                            title = title.replace(suffix, "").strip()
+                        
+                        # Parse format: "Artist - Track" or "Track - Artist"
+                        if " - " in title:
+                            parts = title.split(" - ", 1)
+                            artist, track = parts[0].strip(), parts[1].strip()
+                        elif ": " in title:
+                            parts = title.split(": ", 1)
+                            artist, track = parts[0].strip(), parts[1].strip()
+                        else:
+                            track, artist = title, "Unknown"
+                        
+                        videos.append({"url": video_url, "title": video_title, "artist": artist, "track": track})
+                
+                print()  # New line
+            
+            # Show full preview with parsed names
+            print(f"\n{Fore.CYAN}{'='*60}")
+            print(f"YOUTUBE PLAYLIST PREVIEW - {name} ({len(videos)} videos)")
+            print(f"{'='*60}{Style.RESET_ALL}")
+            for i, video in enumerate(videos, 1):
+                print(f"{Fore.WHITE}[{i}] {video['artist']} - {video['track']}{Style.RESET_ALL}")
+            
+            remove = input(f"\n{Fore.CYAN}Videos to remove (comma-separated, Enter for none): {Style.RESET_ALL}").strip()
+            if remove:
+                try:
+                    bad = {int(x.strip())-1 for x in remove.split(",") if x.strip().isdigit()}
+                    videos = [v for i, v in enumerate(videos) if i not in bad]
+                    print(f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} Removed {len(bad)} videos, {len(videos)} remaining")
+                except:
+                    pass
+            
+            if not videos:
+                print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} No videos remaining")
+                return
+            
+            if input(f"\n{Fore.CYAN}Download {len(videos)} videos? [Y/N]: {Style.RESET_ALL}").strip().lower() != "y":
+                return
+            
+            out_dir = os.path.join(DIRS["YT_PLAYLIST"], clean_name(name))
+            os.makedirs(out_dir, exist_ok=True)
+            
+            print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Downloading to: {out_dir}\n")
+            
+            # Download each video
+            failed = []
+            
+            for i, video in enumerate(videos, 1):
+                print(f"\n{'='*60}")
+                print(f"[{i}/{len(videos)}] {video['artist']} - {video['track']}")
+                print('='*60)
+                
+                result = download_url(video['url'], out_dir)
+                if isinstance(result, dict) and not result.get("success"):
+                    failed.append({"title": video['title'], "url": video['url'], "reason": result.get("reason", "Unknown")})
+            
+            # Write failed log
+            if failed:
+                log_file = os.path.join(out_dir, f"_FAILED_DOWNLOADS_{clean_name(name)}.txt")
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    f.write(f"Failed Downloads - {name}\n")
+                    f.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                    f.write(f"Total: {len(failed)}\n")
+                    f.write("="*60 + "\n\n")
+                    
+                    for item in failed:
+                        f.write(f"Title: {item['title']}\n")
+                        f.write(f"URL: {item['url']}\n")
+                        f.write(f"Reason: {item['reason']}\n")
+                        f.write("-"*60 + "\n")
+                
+                print(f"\n{Fore.YELLOW}[WARNING]{Style.RESET_ALL} {len(failed)} failed")
+                print(f"{Fore.CYAN}[LOG]{Style.RESET_ALL} {log_file}")
+            else:
+                print(f"\n{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} All downloads completed!")
+    except Exception as e:
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {e}")
+
+# ======================== SETTINGS ============================
+# ======================= SETTINGS ============================
 
 def save_config():
-    """Save current configuration to a file"""
+    """Save config to file"""
     config = {
-        "library_path": BASE,
-        "spotify_client_id": os.getenv("SPOTIFY_CLIENT_ID", ""),
-        "spotify_client_secret": os.getenv("SPOTIFY_CLIENT_SECRET", ""),
-        "genius_token": os.getenv("GENIUS_TOKEN", "")
+        "LIBRARY_PATH": BASE,
+        "SPOTIFY_CLIENT_ID": os.getenv("SPOTIFY_CLIENT_ID", ""),
+        "SPOTIFY_CLIENT_SECRET": os.getenv("SPOTIFY_CLIENT_SECRET", ""),
+        "GENIUS_TOKEN": os.getenv("GENIUS_TOKEN", "")
     }
     
-    config_file = os.path.join(os.getcwd(), "reel_config.txt")
-    try:
-        with open(config_file, 'w', encoding='utf-8') as f:
-            f.write("# REEL Configuration\n")
-            f.write(f"# Last updated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write(f"LIBRARY_PATH={config['library_path']}\n")
-            f.write(f"SPOTIFY_CLIENT_ID={config['spotify_client_id']}\n")
-            f.write(f"SPOTIFY_CLIENT_SECRET={config['spotify_client_secret']}\n")
-            f.write(f"GENIUS_TOKEN={config['genius_token']}\n")
-        print(f"\n[SUCCESS] Configuration saved to: {config_file}")
-        return True
-    except Exception as e:
-        print(f"\n[ERROR] Failed to save configuration: {e}")
-        return False
+    with open("reel_config.txt", 'w') as f:
+        for k, v in config.items():
+            f.write(f"{k}={v}\n")
+    print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} Config saved")
 
 def load_config():
-    """Load configuration from file if it exists"""
-    config_file = os.path.join(os.getcwd(), "reel_config.txt")
-    
-    if not os.path.exists(config_file):
+    """Load config from file"""
+    if not os.path.exists("reel_config.txt"):
         return None
     
     config = {}
-    try:
-        with open(config_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
-                    key, value = line.split('=', 1)
-                    config[key] = value
-        return config
-    except Exception:
-        return None
-
-def configure_spotify():
-    """Configure Spotify API credentials"""
-    print("\n========== SPOTIFY API CONFIGURATION ==========")
-    print("\nTo get your Spotify API credentials:")
-    print("1. Go to: https://developer.spotify.com/dashboard")
-    print("2. Log in or create an account")
-    print("3. Click 'Create App'")
-    print("4. Fill in the form (any name/description)")
-    print("5. Copy your Client ID and Client Secret")
-    print("\n" + "="*50)
-    
-    current_id = os.getenv("SPOTIFY_CLIENT_ID", "")
-    current_secret = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-    
-    if current_id:
-        print(f"\nCurrent Client ID: {current_id[:20]}...")
-        print(f"Current Client Secret: {current_secret[:20]}...")
-    else:
-        print("\nNo credentials configured yet")
-    
-    print("\nLeave blank to keep current values.")
-    
-    client_id = input("\nEnter Spotify Client ID: ").strip()
-    client_secret = input("Enter Spotify Client Secret: ").strip()
-    
-    if client_id and client_secret:
-        # Set environment variables for current session
-        os.environ["SPOTIFY_CLIENT_ID"] = client_id
-        os.environ["SPOTIFY_CLIENT_SECRET"] = client_secret
-        
-        # Reinitialize Spotify client
-        global sp
-        sp = init_spotify()
-        
-        # Test the credentials
-        print("\n[INFO] Testing credentials...")
-        try:
-            sp.search(q="test", type="track", limit=1)
-            print("[SUCCESS] Spotify credentials are valid!")
-            
-            # Save to config file
-            save_config()
-            
-            print("\n" + "="*50)
-            print("IMPORTANT: To make these credentials permanent,")
-            print("set them as environment variables:")
-            print("\nWindows:")
-            print(f'  setx SPOTIFY_CLIENT_ID "{client_id}"')
-            print(f'  setx SPOTIFY_CLIENT_SECRET "{client_secret}"')
-            print("\nmacOS/Linux:")
-            print(f'  export SPOTIFY_CLIENT_ID="{client_id}"')
-            print(f'  export SPOTIFY_CLIENT_SECRET="{client_secret}"')
-            print("="*50)
-            
-        except Exception as e:
-            print(f"[ERROR] Invalid credentials: {e}")
-            print("[INFO] Reverting to previous credentials...")
-            # Revert to previous values
-            if current_id:
-                os.environ["SPOTIFY_CLIENT_ID"] = current_id
-                os.environ["SPOTIFY_CLIENT_SECRET"] = current_secret
-            sp = init_spotify()
-    else:
-        print("\n[INFO] No changes made to Spotify credentials")
-
-def configure_genius():
-    """Configure Genius API credentials"""
-    print("\n========== GENIUS API CONFIGURATION ==========")
-    print("\nTo get your Genius API token:")
-    print("1. Go to: https://genius.com/api-clients")
-    print("2. Log in or create an account")
-    print("3. Click 'New API Client'")
-    print("4. Fill in the form (any name/description)")
-    print("5. Copy your 'Client Access Token'")
-    print("\n" + "="*50)
-    
-    current_token = os.getenv("GENIUS_TOKEN", "")
-    
-    if current_token:
-        print(f"\nCurrent Token: {current_token[:30]}...")
-    else:
-        print("\nNo token configured yet")
-    
-    print("\nLeave blank to keep current value.")
-    print("Note: Genius API is currently not used by the downloader.")
-    
-    token = input("\nEnter Genius Access Token: ").strip()
-    
-    if token:
-        # Set environment variable for current session
-        os.environ["GENIUS_TOKEN"] = token
-        
-        # Reinitialize Genius client
-        global genius
-        genius = init_genius()
-        
-        print("[SUCCESS] Genius token updated!")
-        
-        # Save to config file
-        save_config()
-        
-        print("\n" + "="*50)
-        print("IMPORTANT: To make this token permanent,")
-        print("set it as an environment variable:")
-        print("\nWindows:")
-        print(f'  setx GENIUS_TOKEN "{token}"')
-        print("\nmacOS/Linux:")
-        print(f'  export GENIUS_TOKEN="{token}"')
-        print("="*50)
-    else:
-        print("\n[INFO] No changes made to Genius token")
+    with open("reel_config.txt", 'r') as f:
+        for line in f:
+            if '=' in line and not line.startswith('#'):
+                k, v = line.strip().split('=', 1)
+                config[k] = v
+    return config
 
 def settings_menu():
-    """Configure application settings"""
+    """Settings menu"""
     while True:
-        print("\n========== SETTINGS ==========")
-        print(f"Current library path: {BASE}")
+        print(f"\n{Fore.CYAN}=== SETTINGS ==={Style.RESET_ALL}")
+        print(f"1. Change library path (current: {BASE})")
+        print(f"2. Configure Spotify API")
+        print(f"3. Configure Genius API")
+        print(f"4. Back")
         
-        # Show current API status
-        current_spotify_id = os.getenv("SPOTIFY_CLIENT_ID", "")
-        if current_spotify_id:
-            print("Spotify API: ✅ Configured")
-        else:
-            print("Spotify API: ❌ Not configured")
-        
-        current_genius = os.getenv("GENIUS_TOKEN", "")
-        if current_genius:
-            print("Genius API: ✅ Configured")
-        else:
-            print("Genius API: ❌ Not configured (optional)")
-        
-        print("\n1. Change library path")
-        print("2. Configure Spotify API credentials")
-        print("3. Configure Genius API token")
-        print("4. Show directory structure")
-        print("5. Save current configuration")
-        print("6. Back to main menu")
-        
-        choice = input("\nSelect [1-6]: ").strip()
+        choice = input(f"{Fore.CYAN}Select: {Style.RESET_ALL}").strip()
         
         if choice == "1":
-            new_path = input("\nEnter new library path: ").strip()
-            if new_path:
-                try:
-                    new_path = clean_path(new_path)
-                    set_dirs(new_path)
-                    save_config()
-                    print(f"\n[SUCCESS] Library path updated to: {BASE}")
-                except Exception as e:
-                    print(f"\n[ERROR] Invalid path: {e}")
-            else:
-                print("\n[INFO] No changes made")
-                
+            path = input("New path: ").strip()
+            if path:
+                set_dirs(path)
+                save_config()
+                print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} Updated")
+        
         elif choice == "2":
-            configure_spotify()
-            
+            print("\nGet credentials: https://developer.spotify.com/dashboard")
+            cid = input("Client ID: ").strip()
+            secret = input("Client Secret: ").strip()
+            if cid and secret:
+                os.environ["SPOTIFY_CLIENT_ID"] = cid
+                os.environ["SPOTIFY_CLIENT_SECRET"] = secret
+                global sp
+                sp = init_spotify()
+                save_config()
+                print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} Updated")
+        
         elif choice == "3":
-            configure_genius()
-            
+            print("\nGet token: https://genius.com/api-clients")
+            token = input("Access Token: ").strip()
+            if token:
+                os.environ["GENIUS_TOKEN"] = token
+                global genius
+                genius = init_genius()
+                save_config()
+                print(f"{Fore.GREEN}[SUCCESS]{Style.RESET_ALL} Updated")
+        
         elif choice == "4":
-            print("\n========== DIRECTORY STRUCTURE ==========")
-            for name, path in DIRS.items():
-                exists = "✅" if os.path.exists(path) else "❌"
-                print(f"{exists} {name:12} → {path}")
-                
-        elif choice == "5":
-            save_config()
-            
-        elif choice == "6":
             break
-            
-        else:
-            print("\n[ERROR] Invalid selection")
 
-# ========================== MENU =========================
+# =========================== MENU ============================
 
 def menu():
-    """Display main menu and handle user input"""
+    """Main menu"""
     print(f"\n{Fore.CYAN}{Style.BRIGHT}╔════════════════════════════════════════╗")
-    print(f"{Fore.CYAN}{Style.BRIGHT}║{Fore.WHITE}              REEL v2.0                 {Fore.CYAN}║")
-    print(f"{Fore.CYAN}{Style.BRIGHT}╚════════════════════════════════════════╝{Style.RESET_ALL}\n")
+    print(f"{Fore.CYAN}║{Fore.WHITE}              REEL v2.0                 {Fore.CYAN}║")
+    print(f"{Fore.CYAN}╚════════════════════════════════════════╝{Style.RESET_ALL}\n")
     
-    print(f"{Fore.LIGHTGREEN_EX}1. {Fore.WHITE}Search & Download Track")
-    print(f"{Fore.LIGHTGREEN_EX}2. {Fore.WHITE}Download from URL")
-    print(f"{Fore.LIGHTCYAN_EX}3. {Fore.WHITE}CSV Import")
-    print(f"{Fore.LIGHTCYAN_EX}4. {Fore.WHITE}URLs from TXT file")
-    print(f"{Fore.LIGHTMAGENTA_EX}5. {Fore.WHITE}Download Spotify Album")
-    print(f"{Fore.LIGHTMAGENTA_EX}6. {Fore.WHITE}Download Spotify Playlist")
-    print(f"{Fore.LIGHTYELLOW_EX}7. {Fore.WHITE}Settings")
-    print(f"{Fore.RED}8. {Fore.WHITE}Exit{Style.RESET_ALL}\n")
-
+    print(f"{Fore.LIGHTGREEN_EX}1.{Fore.WHITE} Search & Download Track")
+    print(f"{Fore.LIGHTGREEN_EX}2.{Fore.WHITE} Download from URL")
+    print(f"{Fore.LIGHTCYAN_EX}3.{Fore.WHITE} CSV Import")
+    print(f"{Fore.LIGHTCYAN_EX}4.{Fore.WHITE} URLs from TXT")
+    print(f"{Fore.LIGHTMAGENTA_EX}5.{Fore.WHITE} Spotify Album")
+    print(f"{Fore.LIGHTMAGENTA_EX}6.{Fore.WHITE} Spotify Playlist")
+    print(f"{Fore.LIGHTMAGENTA_EX}7.{Fore.WHITE} YouTube Playlist")
+    print(f"{Fore.LIGHTYELLOW_EX}8.{Fore.WHITE} Settings")
+    print(f"{Fore.RED}9.{Fore.WHITE} Exit\n")
+    
     try:
-        c = input(f"{Fore.CYAN}Select [1-8]: {Style.RESET_ALL}").strip()
-
+        c = input(f"{Fore.CYAN}Select [1-9]: {Style.RESET_ALL}").strip()
+        
         if c == "1":
-            print(f"\n{Fore.LIGHTGREEN_EX}═══ Search & Download Track ═══{Style.RESET_ALL}")
-            track = input(f"{Fore.WHITE}Track name: {Style.RESET_ALL}").strip()
-            artist = input(f"{Fore.WHITE}Artist name: {Style.RESET_ALL}").strip()
+            track = input("Track: ").strip()
+            artist = input("Artist: ").strip()
             if track and artist:
                 download_track(track, artist)
-            else:
-                print(f"\n{Fore.RED}[ERROR]{Style.RESET_ALL} Both track and artist are required")
-                
+        
         elif c == "2":
-            print(f"\n{Fore.LIGHTGREEN_EX}═══ Download from URL ═══{Style.RESET_ALL}")
-            url = input(f"{Fore.WHITE}Enter URL: {Style.RESET_ALL}").strip()
+            url = input("URL: ").strip()
             if url:
-                download_url(url)
-            else:
-                print(f"\n{Fore.RED}[ERROR]{Style.RESET_ALL} URL required")
-                
+                # Extract and show preview first
+                try:
+                    import io
+                    import contextlib
+                    
+                    stderr_buffer = io.StringIO()
+                    with contextlib.redirect_stderr(stderr_buffer):
+                        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "logger": yt_logger(), "no_color": True}) as ydl:
+                            print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} Extracting info...")
+                            info = ydl.extract_info(url, download=False)
+                            title = info.get("title", "Unknown")
+                            duration = info.get("duration", 0)
+                            uploader = info.get("uploader", "Unknown")
+                            
+                            # Parse track/artist from title
+                            if " - " in title:
+                                parts = title.split(" - ", 1)
+                                artist, track = parts[0].strip(), parts[1].strip()
+                            else:
+                                track, artist = title, "Unknown"
+                            
+                            # Clean up common suffixes
+                            cleanup_patterns = [
+                                "(Official Video)", "(Official Audio)", "(Official Music Video)",
+                                "[Official Video]", "[Official Audio]", "[Official Music Video]",
+                                "(Lyrics)", "[Lyrics]", "(Lyric Video)", "[Lyric Video]",
+                                "(Official Lyric Video)", "[Official Lyric Video]",
+                                "(Audio)", "[Audio]", "(Visualizer)", "[Visualizer]",
+                                "(Official Visualizer)", "[Official Visualizer]",
+                                "(Music Video)", "[Music Video]", "(HD)", "[HD]",
+                                "(4K)", "[4K]", "(Live)", "[Live]"
+                            ]
+                            
+                            for pattern in cleanup_patterns:
+                                track = track.replace(pattern, "").strip()
+                                artist = artist.replace(pattern, "").strip()
+                            
+                            # Show preview
+                            print(f"\n{Fore.CYAN}{'='*60}")
+                            print(f"URL PREVIEW")
+                            print(f"{'='*60}{Style.RESET_ALL}")
+                            print(f"{Fore.GREEN}Track:{Style.RESET_ALL} {track}")
+                            print(f"{Fore.GREEN}Artist:{Style.RESET_ALL} {artist}")
+                            print(f"{Fore.GREEN}Duration:{Style.RESET_ALL} {duration//60}:{duration%60:02d}")
+                            print(f"{Fore.GREEN}Source:{Style.RESET_ALL} {uploader}")
+                            print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
+                            
+                            if input(f"\n{Fore.CYAN}Download this track? [Y/N]: {Style.RESET_ALL}").strip().lower() == "y":
+                                download_url(url)
+                except Exception as e:
+                    print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} Could not extract info: {e}")
+                    print(f"{Fore.YELLOW}[INFO]{Style.RESET_ALL} Try downloading anyway? [Y/N]")
+                    if input().strip().lower() == "y":
+                        download_url(url)
+        
         elif c == "3":
-            print(f"\n{Fore.LIGHTCYAN_EX}═══ CSV Import ═══{Style.RESET_ALL}")
-            path = input(f"{Fore.WHITE}CSV file path: {Style.RESET_ALL}").strip()
+            path = input("CSV path: ").strip()
             if path:
                 process_csv(path)
-            else:
-                print(f"\n{Fore.RED}[ERROR]{Style.RESET_ALL} Path required")
-                
+        
         elif c == "4":
-            print(f"\n{Fore.LIGHTCYAN_EX}═══ URLs from TXT ═══{Style.RESET_ALL}")
-            path = input(f"{Fore.WHITE}TXT file path (one URL per line): {Style.RESET_ALL}").strip()
+            path = input("TXT path: ").strip()
             if path:
                 process_urls_txt(path)
-            else:
-                print(f"\n{Fore.RED}[ERROR]{Style.RESET_ALL} Path required")
-                
+        
         elif c == "5":
-            print(f"\n{Fore.LIGHTMAGENTA_EX}═══ Download Spotify Album ═══{Style.RESET_ALL}")
-            download_album()  # Call without parameters to show input method selection
-                
+            aid = input("Album ID/URL or search name: ").strip()
+            if aid:
+                # Extract ID from URL if needed
+                if "album/" in aid:
+                    aid = aid.split("album/")[1].split("?")[0]
+                    download_spotify_album(aid)
+                else:
+                    # Search by name
+                    artist = input("Artist: ").strip()
+                    album_id = search_spotify_album(aid, artist)
+                    if album_id:
+                        download_spotify_album(album_id)
+        
         elif c == "6":
-            print(f"\n{Fore.LIGHTMAGENTA_EX}═══ Download Spotify Playlist ═══{Style.RESET_ALL}")
-            playlist = input(f"{Fore.WHITE}Spotify Playlist ID or URL: {Style.RESET_ALL}").strip()
-            if playlist:
-                download_playlist(playlist)
-            else:
-                print(f"\n{Fore.RED}[ERROR]{Style.RESET_ALL} Playlist ID/URL required")
-                
+            pid = input("Playlist ID/URL: ").strip()
+            if pid:
+                # Extract ID from URL if needed
+                if "playlist/" in pid:
+                    pid = pid.split("playlist/")[1].split("?")[0]
+                download_spotify_playlist(pid)
+        
         elif c == "7":
-            print(f"\n{Fore.LIGHTYELLOW_EX}═══ Settings ═══{Style.RESET_ALL}")
-            settings_menu()
-            
+            url = input("Playlist URL: ").strip()
+            if url:
+                download_youtube_playlist(url)
+        
         elif c == "8":
+            settings_menu()
+        
+        elif c == "9":
             print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Exiting... Goodbye!")
-            sys.exit(0)
-            
-        else:
-            print(f"\n{Fore.RED}[ERROR]{Style.RESET_ALL} Invalid selection. Please choose 1-8")
-            
+            raise SystemExit(0)
+    
     except KeyboardInterrupt:
-        print(f"\n\n{Fore.YELLOW}[INFO]{Style.RESET_ALL} Operation cancelled by user")
+        print(f"\n{Fore.YELLOW}[CANCELLED]{Style.RESET_ALL}")
+    except SystemExit:
+        raise  # Re-raise SystemExit to actually exit
     except Exception as e:
-        print(f"\n[ERROR] Unexpected error: {e}")
+        print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {e}")
 
-# =========================== RUN =========================
+# =========================== MAIN ============================
 
 if __name__ == "__main__":
     print(f"\n{Fore.CYAN}{Style.BRIGHT}{'='*60}")
     print(f" {Fore.WHITE}REEL - Starting...")
     print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
     
-    # Try to load saved configuration
     config = load_config()
     if config:
-        print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Loading saved configuration...")
-        
-        # Load library path
         if config.get("LIBRARY_PATH"):
-            try:
-                set_dirs(config["LIBRARY_PATH"])
-                print(f"{Fore.GREEN}[✓]{Style.RESET_ALL} Library path: {BASE}")
-            except:
-                pass
-        
-        # Load Spotify credentials
-        if config.get("SPOTIFY_CLIENT_ID") and config.get("SPOTIFY_CLIENT_SECRET"):
+            set_dirs(config["LIBRARY_PATH"])
+        if config.get("SPOTIFY_CLIENT_ID"):
             os.environ["SPOTIFY_CLIENT_ID"] = config["SPOTIFY_CLIENT_ID"]
-            os.environ["SPOTIFY_CLIENT_SECRET"] = config["SPOTIFY_CLIENT_SECRET"]
+            os.environ["SPOTIFY_CLIENT_SECRET"] = config.get("SPOTIFY_CLIENT_SECRET", "")
             sp = init_spotify()
-            if sp:
-                print(f"{Fore.GREEN}[✓]{Style.RESET_ALL} Spotify API: Credentials loaded")
-            else:
-                print(f"{Fore.YELLOW}[!]{Style.RESET_ALL} Spotify API: Failed to initialize")
-        else:
-            sp = None
-            print(f"{Fore.YELLOW}[!]{Style.RESET_ALL} Spotify API: Not configured")
-        
-        # Load Genius token
         if config.get("GENIUS_TOKEN"):
             os.environ["GENIUS_TOKEN"] = config["GENIUS_TOKEN"]
             genius = init_genius()
-            if genius:
-                print(f"{Fore.GREEN}[✓]{Style.RESET_ALL} Genius API: Token loaded (lyrics support enabled)")
-    else:
-        print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Library location: {BASE}")
-        sp = init_spotify()
-        if not sp:
-            print(f"\n{Fore.YELLOW}{Style.BRIGHT}{'='*60}")
-            print(f"{Fore.RED}⚠️  WARNING: Spotify API credentials not configured!")
-            print(f"{Fore.YELLOW}{'='*60}{Style.RESET_ALL}")
-            print(f"\n{Fore.WHITE}To use REEL, you need FREE Spotify API credentials.")
-            print(f"\n{Fore.CYAN}How to get them (takes 2 minutes):{Style.RESET_ALL}")
-            print(f"{Fore.WHITE}1. Go to: {Fore.LIGHTCYAN_EX}https://developer.spotify.com/dashboard")
-            print(f"{Fore.WHITE}2. Log in (or create free account)")
-            print(f"{Fore.WHITE}3. Click 'Create App'")
-            print(f"{Fore.WHITE}4. Copy your Client ID and Client Secret")
-            print(f"{Fore.WHITE}5. Go to Settings (Option 7) to configure them")
-            print(f"\n{Fore.YELLOW}OR set environment variables:")
-            print(f"{Fore.WHITE}  Windows: {Fore.LIGHTGREEN_EX}setx SPOTIFY_CLIENT_ID \"your_id\"")
-            print(f"{Fore.WHITE}  macOS/Linux: {Fore.LIGHTGREEN_EX}export SPOTIFY_CLIENT_ID=\"your_id\"")
-            print(f"{Fore.YELLOW}{'='*60}{Style.RESET_ALL}")
-            print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} You can still access Settings to configure credentials")
     
-    print(f"\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Press Ctrl+C at any time to cancel\n")
+    if not sp:
+        print(f"\n{Fore.YELLOW}⚠️  Spotify API not configured!{Style.RESET_ALL}")
+        print("Get credentials: https://developer.spotify.com/dashboard")
+        print("Then go to Settings (Option 8)\n")
     
     try:
         while True:
             menu()
-    except KeyboardInterrupt:
-        print(f"\n\n{Fore.CYAN}[INFO]{Style.RESET_ALL} Shutdown complete. Goodbye!")
+    except (KeyboardInterrupt, SystemExit):
+        print(f"\n{Fore.CYAN}Goodbye!{Style.RESET_ALL}")
         sys.exit(0)
